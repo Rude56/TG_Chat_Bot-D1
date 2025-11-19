@@ -1,10 +1,4 @@
-/**
- * Telegram Bot Worker v3.12 (One Card Edition)
- * 特性: 内存级防抖 | 自动清理旧卡 | 永远只保留一张通知 | 聚合收件箱
- */
-
 // --- 静态配置与缓存 ---
-// 内存缓存结构优化：user_locks 用于毫秒级并发防抖
 const CACHE = { data: {}, ts: 0, ttl: 60000, user_locks: {} };
 const DEFAULTS = {
     welcome_msg: "欢迎！使用前请先完成人机验证。",
@@ -12,7 +6,8 @@ const DEFAULTS = {
     block_threshold: "5", enable_admin_receipt: "true",
     enable_image_forwarding: "true", enable_link_forwarding: "true", enable_text_forwarding: "true",
     enable_channel_forwarding: "true", enable_forward_forwarding: "true", enable_audio_forwarding: "true", enable_sticker_forwarding: "true",
-    backup_group_id: "", unread_topic_id: ""
+    backup_group_id: "", unread_topic_id: "",
+    busy_mode: "false", busy_msg: "当前是非营业时间，消息已收到，管理员稍后回复。"
 };
 
 const MSG_TYPES = [
@@ -32,7 +27,7 @@ export default {
         
         if (req.method === "GET") {
             if (url.pathname === "/verify") return handleVerifyPage(url, env);
-            if (url.pathname === "/") return new Response("Bot Running v3.12", { status: 200 });
+            if (url.pathname === "/") return new Response("Bot Running v3.14", { status: 200 });
         }
         if (req.method === "POST") {
             if (url.pathname === "/submit_token") return handleTokenSubmit(req, env);
@@ -40,7 +35,7 @@ export default {
                 const update = await req.json();
                 ctx.waitUntil(handleUpdate(update, env, ctx));
                 return new Response("OK");
-            } catch (e) { return new Response("Err", { status: 500 }); }
+            } catch (e) { console.error(e); return new Response("Err", { status: 500 }); }
         }
         return new Response("404", { status: 404 });
     }
@@ -204,6 +199,16 @@ async function handleVerifiedMsg(msg, u, env) {
         }
     }
 
+    // 忙碌模式自动回复
+    if (await getBool('busy_mode', env)) {
+        const now = Date.now();
+        if (now - (u.user_info.last_busy_reply || 0) > 300000) { // 5分钟防抖
+            const busyMsg = await getCfg('busy_msg', env);
+            await api(env.BOT_TOKEN, "sendMessage", { chat_id: id, text: "🌙 " + busyMsg });
+            await updUser(id, { user_info: { ...u.user_info, last_busy_reply: now } }, env);
+        }
+    }
+
     if (text) {
         const rules = await getJsonCfg('keyword_responses', env);
         const match = rules.find(r => new RegExp(r.keywords, 'gi').test(text));
@@ -214,7 +219,9 @@ async function handleVerifiedMsg(msg, u, env) {
 }
 
 async function relayToTopic(msg, u, env) {
-    const uid = u.user_id, uMeta = getUMeta(msg.from, msg.date);
+    // [修复] 传入 msg.from 获取Telegram信息，传入 u 获取数据库备注
+    const uMeta = getUMeta(msg.from, u, msg.date);
+    const uid = u.user_id;
     let tid = u.topic_id;
 
     if (!tid) {
@@ -223,7 +230,7 @@ async function relayToTopic(msg, u, env) {
             tid = t.message_thread_id.toString();
             await updUser(uid, { topic_id: tid, user_info: { ...u.user_info, name: uMeta.name, username: uMeta.username } }, env);
             await api(env.BOT_TOKEN, "sendMessage", { chat_id: env.ADMIN_GROUP_ID, message_thread_id: tid, text: uMeta.card, parse_mode: "HTML", reply_markup: getBtns(uid, u.is_blocked) });
-        } catch (e) { return api(env.BOT_TOKEN, "sendMessage", { chat_id: uid, text: "系统繁忙，请稍后重试" }); }
+        } catch (e) { console.error(e); return api(env.BOT_TOKEN, "sendMessage", { chat_id: uid, text: "系统繁忙，请稍后重试" }); }
     }
 
     try {
@@ -243,7 +250,7 @@ async function relayToTopic(msg, u, env) {
     }
 }
 
-// --- 收件箱聚合 (One Card 逻辑核心) ---
+// --- 收件箱聚合 (单人单卡逻辑) ---
 async function handleInbox(env, msg, u, tid, uMeta) {
     let inboxId = await getCfg('unread_topic_id', env);
     if (!inboxId) {
@@ -254,23 +261,17 @@ async function handleInbox(env, msg, u, tid, uMeta) {
         } catch { return; }
     }
 
-    // 1. 内存级防抖 (毫秒级并发控制)
     const now = Date.now();
+    // 内存锁(5秒) + 数据库锁(5分钟) 双重防抖
     if (CACHE.user_locks[u.user_id] && now - CACHE.user_locks[u.user_id] < 5000) return;
-    
-    // 2. 数据库级防抖 (5分钟)
     const lastNotify = u.user_info.last_notify || 0;
     if (now - lastNotify < 300000) return; 
 
-    // 锁定内存
     CACHE.user_locks[u.user_id] = now;
 
-    // 3. 核心逻辑：尝试删除上一张卡片
+    // 核心：删除旧卡
     if (u.user_info.inbox_msg_id) {
-        await api(env.BOT_TOKEN, "deleteMessage", { 
-            chat_id: env.ADMIN_GROUP_ID, 
-            message_id: u.user_info.inbox_msg_id 
-        }).catch(() => {}); // 忽略删除失败（比如已经被手动删了）
+        await api(env.BOT_TOKEN, "deleteMessage", { chat_id: env.ADMIN_GROUP_ID, message_id: u.user_info.inbox_msg_id }).catch(() => {});
     }
 
     const gid = env.ADMIN_GROUP_ID.toString().replace(/^-100/, '');
@@ -282,12 +283,7 @@ async function handleInbox(env, msg, u, tid, uMeta) {
             chat_id: env.ADMIN_GROUP_ID, message_thread_id: inboxId, text: card, parse_mode: "HTML", 
             reply_markup: { inline_keyboard: [[{ text: "🚀 直达回复", url: `https://t.me/c/${gid}/${tid}` }, { text: "✅ 已阅/删除", callback_data: `inbox:del:${u.user_id}` }]] }
         });
-        
-        // 4. 保存新的消息 ID
-        await updUser(u.user_id, { 
-            user_info: { ...u.user_info, last_notify: now, inbox_msg_id: newMsg.message_id } 
-        }, env);
-
+        await updUser(u.user_id, { user_info: { ...u.user_info, last_notify: now, inbox_msg_id: newMsg.message_id } }, env);
     } catch (e) {
         if (e.message.includes("thread")) await setCfg('unread_topic_id', "", env);
     }
@@ -304,7 +300,22 @@ async function handleBackup(msg, meta, env) {
 }
 
 async function handleAdminReply(msg, env) {
+    const cid = msg.chat.id.toString();
     if (!msg.message_thread_id || msg.from.is_bot || !(await isAuthAdmin(msg.from.id, env))) return;
+
+    // 检查是否在设置备注
+    const stateStr = await getCfg(`admin_state:${msg.from.id}`, env);
+    if (stateStr) {
+        const state = JSON.parse(stateStr);
+        if (state.action === 'input_note') {
+            const targetUid = state.target;
+            const u = await getUser(targetUid, env);
+            await updUser(targetUid, { user_info: { ...u.user_info, note: msg.text } }, env);
+            await setCfg(`admin_state:${msg.from.id}`, "", env);
+            return api(env.BOT_TOKEN, "sendMessage", { chat_id: cid, message_thread_id: msg.message_thread_id, text: `✅ 备注已更新: ${msg.text}` });
+        }
+    }
+
     const uid = (await sql(env, "SELECT user_id FROM users WHERE topic_id = ?", msg.message_thread_id.toString(), 'first'))?.user_id;
     if (!uid) return;
     try {
@@ -348,7 +359,7 @@ async function verifyAnswer(id, ans, env) {
     } else api(env.BOT_TOKEN, "sendMessage", { chat_id: id, text: "❌ 答案错误" });
 }
 
-// --- 菜单与管理 ---
+// --- 菜单与交互 ---
 async function handleCallback(cb, env) {
     const { data, message: msg, from } = cb;
     const [act, p1, p2, p3] = data.split(':');
@@ -356,12 +367,16 @@ async function handleCallback(cb, env) {
     if (act === 'inbox' && p1 === 'del') {
         const targetUid = p2;
         await api(env.BOT_TOKEN, "deleteMessage", { chat_id: msg.chat.id, message_id: msg.message_id }).catch(()=>{});
-        // 重置防抖，允许立即推送新消息
         if (targetUid) {
             const u = await getUser(targetUid, env);
             await updUser(targetUid, { user_info: { ...u.user_info, last_notify: 0 } }, env);
         }
         return api(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: cb.id, text: "已处理" });
+    }
+    
+    if (act === 'note' && p1 === 'set') {
+        await setCfg(`admin_state:${from.id}`, JSON.stringify({ action: 'input_note', target: p2 }), env);
+        return api(env.BOT_TOKEN, "sendMessage", { chat_id: msg.chat.id, message_thread_id: msg.message_thread_id, text: "⌨️ 请回复该用户的备注内容：" });
     }
 
     if (act === 'config') {
@@ -387,17 +402,21 @@ async function handleAdminConfig(cid, mid, type, key, val, env) {
     const back = { text: "🔙 返回", callback_data: "config:menu" };
     
     if (!type || type === 'menu') { 
-        if (!key) return edit("⚙️ <b>控制面板</b>", { inline_keyboard: [[{text:"📝 基础",callback_data:"config:menu:base"},{text:"🤖 自动回复",callback_data:"config:menu:ar"}], [{text:"🚫 屏蔽词",callback_data:"config:menu:kw"},{text:"🛠 过滤",callback_data:"config:menu:fl"}], [{text:"👮 协管",callback_data:"config:menu:auth"},{text:"💾 备份/通知",callback_data:"config:menu:bak"}]] });
+        if (!key) return edit("⚙️ <b>控制面板</b>", { inline_keyboard: [[{text:"📝 基础",callback_data:"config:menu:base"},{text:"🤖 自动回复",callback_data:"config:menu:ar"}], [{text:"🚫 屏蔽词",callback_data:"config:menu:kw"},{text:"🛠 过滤",callback_data:"config:menu:fl"}], [{text:"👮 协管",callback_data:"config:menu:auth"},{text:"💾 备份/通知",callback_data:"config:menu:bak"}], [{text:"🌙 营业状态",callback_data:"config:menu:busy"}]] });
         if (key === 'base') return edit(`基础配置`, { inline_keyboard: [[{text:"欢迎语",callback_data:"config:edit:welcome_msg"},{text:"问题",callback_data:"config:edit:verif_q"},{text:"答案",callback_data:"config:edit:verif_a"}], [back]] });
         if (key === 'fl') return handleFilterMenu(cid, mid, env);
         if (key === 'bak') {
             const bid = await getCfg('backup_group_id', env), uid = await getCfg('unread_topic_id', env);
             return edit(`💾 <b>备份与通知</b>\n备份群: ${bid||"无"}\n聚合话题: ${uid?`✅ (ID:${uid})`:"⏳ 等待触发"}`, { inline_keyboard: [[{text:"设备份群",callback_data:"config:edit:backup_group_id"},{text:"清备份",callback_data:"config:cl:backup_group_id"}],[{text:"重置聚合话题",callback_data:"config:cl:unread_topic_id"}],[back]] });
         }
+        if (key === 'busy') {
+            const on = await getBool('busy_mode', env), msg = await getCfg('busy_msg', env);
+            return edit(`🌙 <b>营业状态</b>\n当前: ${on?"🔴 休息中 (自动回复)":"🟢 营业中 (无自动回复)"}\n回复语: ${escape(msg)}`, { inline_keyboard: [[{text:`切换为 ${on?"🟢 营业":"🔴 休息"}`,callback_data:`config:toggle:busy_mode:${!on}`}], [{text:"✏️ 修改回复语",callback_data:"config:edit:busy_msg"}], [back]] });
+        }
         if (['ar','kw','auth'].includes(key)) return handleListMenu(cid, mid, key, env);
     }
 
-    if (type === 'toggle') { await setCfg(key, val, env); return handleFilterMenu(cid, mid, env); }
+    if (type === 'toggle') { await setCfg(key, val, env); return key==='busy_mode' ? handleAdminConfig(cid,mid,'menu','busy',null,env) : handleFilterMenu(cid, mid, env); }
     if (type === 'cl') { await setCfg(key, key==='authorized_admins'?'[]':'', env); return handleAdminConfig(cid, mid, 'menu', key==='unread_topic_id'?'bak':(key==='authorized_admins'?'auth':'bak'), null, env); }
     if (type === 'del') { 
         let l = await getJsonCfg(key === 'kw' ? 'block_keywords' : 'keyword_responses', env);
@@ -450,10 +469,17 @@ async function sendAdminMenu(id, env) { handleAdminConfig(id, null, 'menu', null
 const getBool = async (k, e) => (await getCfg(k, e)) === 'true';
 const getJsonCfg = async (k, e) => { try { return JSON.parse(await getCfg(k, e, '[]'))||[]; } catch { return []; } };
 const escape = t => (t||"").toString().replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-const getBtns = (id, blk) => ({ inline_keyboard: [[{ text: blk?"✅ 解封":"🚫 屏蔽", callback_data: `${blk?'unblock':'block'}:${id}` }], [{ text: "📌 置顶", callback_data: `pin_card:${id}` }]] });
+const getBtns = (id, blk) => ({ inline_keyboard: [[{ text: blk?"✅ 解封":"🚫 屏蔽", callback_data: `${blk?'unblock':'block'}:${id}` }], [{ text: "✏️ 备注", callback_data: `note:set:${id}` }, { text: "📌 置顶", callback_data: `pin_card:${id}` }]] });
 const isAuthAdmin = async (id, e) => (e.ADMIN_IDS||"").includes(id) || (await getJsonCfg('authorized_admins', e)).includes(id.toString());
-const getUMeta = (u, d) => {
-    const id = u.id.toString(), name = (u.first_name||"")+(u.last_name?" "+u.last_name:"");
-    const userLink = u.username ? `<a href="tg://user?id=${id}">@${u.username}</a>` : `<code>无</code>`;
-    return { userId: id, name, username: u.username, topicName: `${name} | ${id}`.substr(0, 128), card: `<b>👤 用户资料</b>\n---\n👤: <code>${escape(name)}</code>\n🔗: ${userLink}\n🆔: <code>${id}</code>\n🕒: <code>${new Date(d*1000).toLocaleString('zh-CN')}</code>` };
+// [修复] getUMeta 现在接收两个对象：tgUser (来自消息) 和 dbUser (来自数据库)
+const getUMeta = (tgUser, dbUser, d) => {
+    const id = tgUser.id.toString();
+    const name = (tgUser.first_name||"")+(tgUser.last_name?" "+tgUser.last_name:"");
+    const note = dbUser.user_info && dbUser.user_info.note ? `\n📝 <b>备注:</b> ${escape(dbUser.user_info.note)}` : "";
+    const userLink = tgUser.username ? `<a href="tg://user?id=${id}">@${tgUser.username}</a>` : `<code>无</code>`;
+    return { 
+        userId: id, name, username: tgUser.username, 
+        topicName: `${name} | ${id}`.substr(0, 128), 
+        card: `<b>👤 用户资料</b>\n---\n👤: <code>${escape(name)}</code>\n🔗: ${userLink}\n🆔: <code>${id}</code>${note}\n🕒: <code>${new Date(d*1000).toLocaleString('zh-CN')}</code>` 
+    };
 };
