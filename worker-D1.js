@@ -1,3 +1,8 @@
+/**
+ * Telegram Bot Worker v3.29 (Self-Healing Edition)
+ * 修复: 话题删除导致死锁 | 优化: 深度自愈/黑名单重建/全链路闭环
+ */
+
 // --- 1. 静态配置 ---
 const CACHE = { data: {}, ts: 0, ttl: 60000, user_locks: {} };
 const DEFAULTS = {
@@ -25,10 +30,9 @@ export default {
     async fetch(req, env, ctx) {
         ctx.waitUntil(dbInit(env));
         const url = new URL(req.url);
-        
         if (req.method === "GET") {
             if (url.pathname === "/verify") return handleVerifyPage(url, env);
-            if (url.pathname === "/") return new Response("Bot v3.27 Ready", { status: 200 });
+            if (url.pathname === "/") return new Response("Bot v3.29 Active", { status: 200 });
         }
         if (req.method === "POST") {
             if (url.pathname === "/submit_token") return handleTokenSubmit(req, env);
@@ -36,7 +40,7 @@ export default {
                 const update = await req.json();
                 ctx.waitUntil(handleUpdate(update, env, ctx));
                 return new Response("OK");
-            } catch (e) { console.error(e); return new Response("Err", { status: 500 }); }
+            } catch (e) { return new Response("Err", { status: 500 }); }
         }
         return new Response("404", { status: 404 });
     }
@@ -47,7 +51,7 @@ const sql = async (env, query, args = [], type = 'run') => {
     try {
         const stmt = env.TG_BOT_DB.prepare(query).bind(...(Array.isArray(args) ? args : [args]));
         return type === 'run' ? await stmt.run() : await stmt[type]();
-    } catch (e) { console.error("DB:", e.message); return null; }
+    } catch (e) { return null; }
 };
 
 async function getCfg(key, env) {
@@ -68,9 +72,9 @@ async function getUser(id, env) {
     let u = await sql(env, "SELECT * FROM users WHERE user_id = ?", id, 'first');
     if (!u) {
         try { await sql(env, "INSERT INTO users (user_id, user_state) VALUES (?, 'new')", id); } catch {}
-        u = await sql(env, "SELECT * FROM users WHERE user_id = ?", id, 'first') || { user_id: id, user_state: 'new', is_blocked: 0, block_count: 0, topic_id: null, user_info: {} };
+        u = await sql(env, "SELECT * FROM users WHERE user_id = ?", id, 'first') || { user_id: id, user_state: 'new', is_blocked: 0, block_count: 0, first_message_sent: 0, topic_id: null, user_info: {} };
     }
-    u.is_blocked = !!u.is_blocked; 
+    u.is_blocked = !!u.is_blocked; u.first_message_sent = !!u.first_message_sent;
     u.user_info = u.user_info_json ? JSON.parse(u.user_info_json) : {};
     return u;
 }
@@ -86,7 +90,7 @@ async function dbInit(env) {
         env.TG_BOT_DB.prepare(`CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)`),
         env.TG_BOT_DB.prepare(`CREATE TABLE IF NOT EXISTS users (user_id TEXT PRIMARY KEY, user_state TEXT DEFAULT 'new', is_blocked INTEGER DEFAULT 0, block_count INTEGER DEFAULT 0, first_message_sent INTEGER DEFAULT 0, topic_id TEXT, user_info_json TEXT)`),
         env.TG_BOT_DB.prepare(`CREATE TABLE IF NOT EXISTS messages (user_id TEXT, message_id TEXT, text TEXT, date INTEGER, PRIMARY KEY (user_id, message_id))`)
-    ]); } catch(e) { console.error("DB Init:", e); }
+    ]); } catch {}
 }
 
 // --- 4. 业务逻辑 ---
@@ -119,16 +123,20 @@ async function handlePrivate(msg, env, ctx) {
     
     if (text === "/start") {
         if (isAdm && ctx) ctx.waitUntil(registerCommands(env));
-        return isAdm ? handleAdminConfig(id, null, 'menu', null, null, env) : sendStart(id, env);
+        return isAdm ? handleAdminConfig(id, null, 'menu', null, null, env) : sendStart(id, msg, env);
     }
     if (text === "/help" && isAdm) return api(env.BOT_TOKEN, "sendMessage", { chat_id: id, text: "ℹ️ <b>帮助</b>\n• 回复消息即对话\n• /start 打开面板", parse_mode: "HTML" });
 
     const u = await getUser(id, env);
 
+    // [自愈] 封禁用户重启：清空黑名单状态，准备重发资料卡
     if (u.is_blocked) {
         if (text === "/start") { 
             await updUser(id, { is_blocked: 0, user_state: 'new', block_count: 0 }, env);
-            return sendStart(id, env);
+            // 尝试删除黑名单话题中的卡片
+            const mockMeta = { id: id, username: u.user_info.username, first_name: u.user_info.name };
+            await manageBlacklist(env, u, mockMeta, false);
+            return sendStart(id, msg, env);
         }
         return; 
     }
@@ -147,13 +155,20 @@ async function handlePrivate(msg, env, ctx) {
     }
 
     const state = u.user_state;
-    if (['new','pending_turnstile'].includes(state)) return sendStart(id, env);
+    if (['new','pending_turnstile'].includes(state)) return sendStart(id, msg, env);
     if (state === 'pending_verification') return verifyAnswer(id, text, env);
     if (state === 'verified') return handleVerifiedMsg(msg, u, env);
 }
 
-async function sendStart(id, env) {
+async function sendStart(id, msg, env) {
     const u = await getUser(id, env);
+    
+    // [核心修复] 尝试补发资料卡。如果报错（说明话题被删），则重置 topic_id 为 null
+    if (u.topic_id) {
+        const success = await sendInfoCardToTopic(env, u, msg.from, u.topic_id);
+        if (!success) await updUser(id, { topic_id: null }, env);
+    }
+
     const url = (env.WORKER_URL || "").replace(/\/$/, '');
     if (!url || !env.TURNSTILE_SITE_KEY) return api(env.BOT_TOKEN, "sendMessage", { chat_id: id, text: "⚠️ 配置缺失: WORKER_URL" });
     
@@ -166,7 +181,7 @@ async function sendStart(id, env) {
 
 async function handleVerifiedMsg(msg, u, env) {
     const id = u.user_id, text = msg.text || "";
-    // 移除首次必须纯文本的限制，解决并发冲突问题
+    if (!u.first_message_sent && (!text || msg.photo || msg.video)) return api(env.BOT_TOKEN, "sendMessage", { chat_id: id, text: "⚠️ 首次需发送纯文本" });
 
     if (text) {
         const kws = await getJsonCfg('block_keywords', env);
@@ -210,21 +225,22 @@ async function relayToTopic(msg, u, env) {
     const uMeta = getUMeta(msg.from, u, msg.date), uid = u.user_id;
     let tid = u.topic_id;
 
-    // 话题创建锁，防止并发重复创建
+    // [自愈] 创建话题
     if (!tid) {
-        if (CACHE.locks[uid]) return; 
-        CACHE.locks[uid] = true;
+        if (CACHE.user_locks[uid]) return;
+        CACHE.user_locks[uid] = true;
         try {
             const t = await api(env.BOT_TOKEN, "createForumTopic", { chat_id: env.ADMIN_GROUP_ID, name: uMeta.topicName });
             tid = t.message_thread_id.toString();
-            const card = await api(env.BOT_TOKEN, "sendMessage", { chat_id: env.ADMIN_GROUP_ID, message_thread_id: tid, text: uMeta.card, parse_mode: "HTML", reply_markup: getBtns(uid, u.is_blocked) });
-            await updUser(uid, { topic_id: tid, user_info: { ...u.user_info, name: uMeta.name, username: uMeta.username, card_msg_id: card.message_id, join_date: msg.date } }, env);
-            await api(env.BOT_TOKEN, "pinChatMessage", { chat_id: env.ADMIN_GROUP_ID, message_id: card.message_id });
+            // 保存 Topic ID，稍后发送卡片
+            await updUser(uid, { topic_id: tid, user_info: { ...u.user_info, name: uMeta.name, username: uMeta.username } }, env);
+            // 发送并置顶卡片
+            await sendInfoCardToTopic(env, u, msg.from, tid, msg.date);
         } catch (e) { 
-            delete CACHE.locks[uid];
+            delete CACHE.user_locks[uid];
             return api(env.BOT_TOKEN, "sendMessage", { chat_id: uid, text: "系统忙" }); 
         }
-        delete CACHE.locks[uid];
+        delete CACHE.user_locks[uid];
     }
 
     try {
@@ -236,6 +252,20 @@ async function relayToTopic(msg, u, env) {
     } catch (e) {
         if (e.message.includes("thread")) { await updUser(uid, { topic_id: null }, env); api(env.BOT_TOKEN, "sendMessage", { chat_id: uid, text: "会话过期，请重发" }); }
     }
+}
+
+// [工具] 发送资料卡，返回成功状态
+async function sendInfoCardToTopic(env, u, tgUser, tid, date) {
+    const meta = getUMeta(tgUser, u, date || (Date.now()/1000));
+    try {
+        const card = await api(env.BOT_TOKEN, "sendMessage", { 
+            chat_id: env.ADMIN_GROUP_ID, message_thread_id: tid, text: meta.card, parse_mode: "HTML", 
+            reply_markup: getBtns(u.user_id, u.is_blocked) 
+        });
+        await api(env.BOT_TOKEN, "pinChatMessage", { chat_id: env.ADMIN_GROUP_ID, message_id: card.message_id });
+        await updUser(u.user_id, { user_info: { ...u.user_info, card_msg_id: card.message_id, join_date: date } }, env);
+        return true;
+    } catch (e) { return false; } // 发送失败（如话题不存在）返回 false
 }
 
 // --- 5. 收件箱与黑名单 ---
@@ -250,9 +280,9 @@ async function handleInbox(env, msg, u, tid, uMeta) {
     }
 
     const now = Date.now();
-    if (CACHE.locks[`inbox_${u.user_id}`] && now - CACHE.locks[`inbox_${u.user_id}`] < 5000) return;
+    if (CACHE.user_locks[`in_${u.user_id}`] && now - CACHE.user_locks[`in_${u.user_id}`] < 5000) return;
     if (now - (u.user_info.last_notify || 0) < 300000) return;
-    CACHE.locks[`inbox_${u.user_id}`] = now;
+    CACHE.user_locks[`in_${u.user_id}`] = now;
 
     if (u.user_info.inbox_msg_id) await api(env.BOT_TOKEN, "deleteMessage", { chat_id: env.ADMIN_GROUP_ID, message_id: u.user_info.inbox_msg_id }).catch(()=>{});
 
@@ -285,8 +315,11 @@ async function manageBlacklist(env, u, tgUser, isBlocking) {
         });
         await updUser(u.user_id, { user_info: { ...u.user_info, blacklist_msg_id: msg.message_id } }, env);
     } else {
+        // [自愈] 如果话题被删，catch后重置配置
         if (u.user_info.blacklist_msg_id) {
-            await api(env.BOT_TOKEN, "deleteMessage", { chat_id: env.ADMIN_GROUP_ID, message_id: u.user_info.blacklist_msg_id }).catch(()=>{});
+            try {
+                await api(env.BOT_TOKEN, "deleteMessage", { chat_id: env.ADMIN_GROUP_ID, message_id: u.user_info.blacklist_msg_id });
+            } catch (e) { if(e.message.includes("thread")) await setCfg('blocked_topic_id', "", env); }
             await updUser(u.user_id, { user_info: { ...u.user_info, blacklist_msg_id: null } }, env);
         }
     }
@@ -318,11 +351,7 @@ async function handleAdminReply(msg, env) {
             if (u.topic_id) {
                 let updated = false;
                 if (u.user_info.card_msg_id) try { await api(env.BOT_TOKEN, "editMessageText", { chat_id: env.ADMIN_GROUP_ID, message_id: u.user_info.card_msg_id, text: newMeta.card, parse_mode: "HTML", reply_markup: getBtns(targetUid, u.is_blocked) }); updated = true; } catch {}
-                if (!updated) {
-                    const nc = await api(env.BOT_TOKEN, "sendMessage", { chat_id: env.ADMIN_GROUP_ID, message_thread_id: u.topic_id, text: newMeta.card, parse_mode: "HTML", reply_markup: getBtns(targetUid, u.is_blocked) });
-                    await api(env.BOT_TOKEN, "pinChatMessage", { chat_id: env.ADMIN_GROUP_ID, message_id: nc.message_id });
-                    u.user_info.card_msg_id = nc.message_id;
-                }
+                if (!updated) await sendInfoCardToTopic(env, u, mockTgUser, u.topic_id, u.user_info.join_date);
             }
             
             if (u.user_info.inbox_msg_id) {
@@ -351,7 +380,7 @@ async function handleEdit(msg, env) {
     await api(env.BOT_TOKEN, "sendMessage", { chat_id: env.ADMIN_GROUP_ID, message_thread_id: u.topic_id, text: `✏️ <b>消息修改</b>\n前: ${escape(old?.text||"?")}\n后: ${escape(newTxt)}`, parse_mode: "HTML" });
 }
 
-// --- 7. 验证 (关键修复: await保证消息送达) ---
+// --- 7. 验证 ---
 async function handleVerifyPage(url, env) {
     const uid = url.searchParams.get('user_id');
     if (!uid || !env.TURNSTILE_SITE_KEY) return new Response("Miss Config", { status: 400 });
@@ -363,7 +392,6 @@ async function handleTokenSubmit(req, env) {
         const r = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ secret: env.TURNSTILE_SECRET_KEY, response: token }) });
         if (!(await r.json()).success) throw new Error("Invalid");
         await updUser(userId, { user_state: "pending_verification" }, env);
-        // [修复] 加上await
         await api(env.BOT_TOKEN, "sendMessage", { chat_id: userId, text: "✅ 验证通过！\n请回答：\n" + await getCfg('verif_q', env) });
         return new Response(JSON.stringify({ success: true }));
     } catch { return new Response(JSON.stringify({ success: false }), { status: 400 }); }
@@ -371,12 +399,11 @@ async function handleTokenSubmit(req, env) {
 async function verifyAnswer(id, ans, env) {
     if (ans.trim() === (await getCfg('verif_a', env)).trim()) {
         await updUser(id, { user_state: "verified" }, env);
-        // [优化] 验证成功后的提示语
         await api(env.BOT_TOKEN, "sendMessage", { chat_id: id, text: "✅ 验证通过！\n现在您可以直接发送消息，我会帮您转达给管理员。" });
     } else await api(env.BOT_TOKEN, "sendMessage", { chat_id: id, text: "❌ 错误" });
 }
 
-// --- 8. 菜单与回调 (关键修复: 传入p3参数) ---
+// --- 8. 菜单与回调 ---
 async function handleCallback(cb, env) {
     const { data, message: msg, from } = cb;
     const [act, p1, p2, p3] = data.split(':');
@@ -395,7 +422,6 @@ async function handleCallback(cb, env) {
     if (act === 'config') {
         if (!(env.ADMIN_IDS||"").includes(from.id.toString())) return api(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: cb.id, text: "无权", show_alert: true });
         await api(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: cb.id });
-        // [修复] 传入 p3 作为 val
         return handleAdminConfig(msg.chat.id, msg.message_id, p1, p2, p3, env);
     }
     
