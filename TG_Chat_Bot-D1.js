@@ -1,7 +1,8 @@
 /**
- * Telegram Bot Worker v3.42
- * 更新日志:
- * 1. [优化] 资料卡完善：无用户名的用户，现在资料卡中的链接字段会显示名字并支持点击跳转 (tg://user?id=...)。
+ * Telegram Bot Worker v3.43
+ * 更新日志: 
+ * 1. 资料卡排版重构 (🪪 用户资料)
+ * 2. 修复无用户名用户的跳转问题 (使用 openmessage 协议偷渡)
  */
 
 // --- 1. 静态配置 ---
@@ -175,17 +176,14 @@ async function handlePrivate(msg, env, ctx) {
         const stateStr = await getCfg(`admin_state:${id}`, env);
         if (stateStr) {
             const state = JSON.parse(stateStr);
-            // 修改：传入完整的 msg 对象，以便处理图片/视频配置
             if (state.action === 'input') return handleAdminInput(id, msg, state, env);
         }
     }
 
     // --- 智能验证路由 ---
-    // 1. 获取两层开关状态
     const isCaptchaOn = await getBool('enable_verify', env);
     const isQAOn = await getBool('enable_qa_verify', env);
 
-    // 2. 如果两者都关闭 -> 强制放行
     if (!isCaptchaOn && !isQAOn) {
         if (u.user_state !== 'verified') {
             await updUser(id, { user_state: "verified" }, env);
@@ -194,10 +192,8 @@ async function handlePrivate(msg, env, ctx) {
         return handleVerifiedMsg(msg, u, env);
     }
 
-    // 3. 如果 Captcha 关闭但 QA 开启，且用户处于初始状态 -> 强制进入 QA
     if (!isCaptchaOn && isQAOn && (u.user_state === 'new' || u.user_state === 'pending_turnstile')) {
         await updUser(id, { user_state: "pending_verification" }, env);
-        // 这里只是兜底，正常由 sendStart 触发
         return sendStart(id, msg, env);
     }
 
@@ -217,14 +213,10 @@ async function sendStart(id, msg, env) {
         if (!success) await updUser(id, { topic_id: null }, env);
     }
 
-    // --- 1. 准备欢迎语数据 ---
     let welcomeRaw = await getCfg('welcome_msg', env);
-    
-    // 昵称处理
     const firstName = (msg.from.first_name || "用户").replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
     const nameLink = `<a href="tg://user?id=${id}">${firstName}</a>`;
     
-    // 尝试解析 JSON (如果是媒体欢迎语)
     let mediaConfig = null;
     let welcomeText = welcomeRaw;
     try {
@@ -234,31 +226,25 @@ async function sendStart(id, msg, env) {
         }
     } catch {}
 
-    // 替换占位符
     welcomeText = welcomeText.replace(/{name}|{user}/g, nameLink);
 
-    // --- 2. 发送欢迎语 (第一条消息) ---
     try {
         if (mediaConfig && mediaConfig.type) {
-            // 发送媒体
-            const method = `send${mediaConfig.type.charAt(0).toUpperCase() + mediaConfig.type.slice(1)}`; // sendPhoto, sendVideo...
+            const method = `send${mediaConfig.type.charAt(0).toUpperCase() + mediaConfig.type.slice(1)}`;
             let body = { chat_id: id, caption: welcomeText, parse_mode: "HTML" };
             if (mediaConfig.type === 'photo') body.photo = mediaConfig.file_id;
             else if (mediaConfig.type === 'video') body.video = mediaConfig.file_id;
             else if (mediaConfig.type === 'animation') body.animation = mediaConfig.file_id;
-            else body = { chat_id: id, text: welcomeText, parse_mode: "HTML" }; // Fallback
+            else body = { chat_id: id, text: welcomeText, parse_mode: "HTML" };
             
             await api(env.BOT_TOKEN, method, body);
         } else {
-            // 发送纯文本
             await api(env.BOT_TOKEN, "sendMessage", { chat_id: id, text: welcomeText, parse_mode: "HTML" });
         }
     } catch (e) {
-        // 出错兜底
         await api(env.BOT_TOKEN, "sendMessage", { chat_id: id, text: "Welcome!", parse_mode: "HTML" });
     }
 
-    // --- 3. 发送验证请求 (第二条消息，如果需要) ---
     const url = (env.WORKER_URL || "").replace(/\/$/, '');
     const mode = await getCfg('captcha_mode', env);
     const hasKey = mode === 'recaptcha' ? env.RECAPTCHA_SITE_KEY : env.TURNSTILE_SITE_KEY;
@@ -266,7 +252,6 @@ async function sendStart(id, msg, env) {
     const isQAOn = await getBool('enable_qa_verify', env);
 
     if (isCaptchaOn && url && hasKey) {
-        // 发送验证按钮
         return api(env.BOT_TOKEN, "sendMessage", { 
             chat_id: id, 
             text: "🛡️ <b>安全验证</b>\n请点击下方按钮完成人机验证以继续。", 
@@ -274,7 +259,6 @@ async function sendStart(id, msg, env) {
             reply_markup: { inline_keyboard: [[{ text: "点击进行验证", web_app: { url: `${url}/verify?user_id=${id}` } }]] } 
         });
     } else if (!isCaptchaOn && isQAOn) {
-        // 发送问题
         await updUser(id, { user_state: "pending_verification" }, env);
         return api(env.BOT_TOKEN, "sendMessage", { 
             chat_id: id, 
@@ -499,7 +483,7 @@ async function handleEdit(msg, env) {
     await api(env.BOT_TOKEN, "sendMessage", { chat_id: env.ADMIN_GROUP_ID, message_thread_id: u.topic_id, text: `✏️ <b>消息修改</b>\n前: ${escape(old?.text||"?")}\n后: ${escape(newTxt)}`, parse_mode: "HTML" });
 }
 
-// --- 7. 融合验证逻辑 ---
+// --- 6. 融合验证逻辑 ---
 async function handleVerifyPage(url, env) {
     const uid = url.searchParams.get('user_id');
     const mode = await getCfg('captcha_mode', env); 
@@ -509,7 +493,6 @@ async function handleVerifyPage(url, env) {
         ? "https://www.google.com/recaptcha/api.js" 
         : "https://challenges.cloudflare.com/turnstile/v0/api.js";
     const divClass = mode === 'recaptcha' ? "g-recaptcha" : "cf-turnstile";
-    // [修复] 优化 HTML 中的 JS 关闭逻辑
     return new Response(`<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><script src="https://telegram.org/js/telegram-web-app.js"></script><script src="${scriptUrl}" async defer></script><style>body{display:flex;justify-content:center;align-items:center;height:100vh;background:#fff;font-family:sans-serif}#c{text-align:center;padding:20px;background:#f0f0f0;border-radius:10px}</style></head><body><div id="c"><h3>🛡️ 安全验证</h3><div class="${divClass}" data-sitekey="${siteKey}" data-callback="S"></div><div id="m"></div></div><script>const tg=window.Telegram.WebApp;tg.ready();function S(t){document.getElementById('m').innerText='验证中...';fetch('/submit_token',{method:'POST',body:JSON.stringify({token:t,userId:'${uid}'})}).then(r=>r.json()).then(d=>{if(d.success){document.getElementById('m').innerText='✅';setTimeout(()=>{tg.close();window.close();},1000)}else{document.getElementById('m').innerText='❌'}}).catch(e=>{document.getElementById('m').innerText='Error'})}</script></body></html>`, { headers: { "Content-Type": "text/html" } });
 }
 
@@ -538,12 +521,10 @@ async function handleTokenSubmit(req, env) {
         }
 
         if (!success) throw new Error("Invalid");
-        // --- Captcha 通过后，判断是否需要回答问题 ---
         if (await getBool('enable_qa_verify', env)) {
             await updUser(userId, { user_state: "pending_verification" }, env);
             await api(env.BOT_TOKEN, "sendMessage", { chat_id: userId, text: "✅ 验证通过！\n请回答：\n" + await getCfg('verif_q', env) });
         } else {
-            // QA 关闭，直接通过
             await updUser(userId, { user_state: "verified" }, env);
             await api(env.BOT_TOKEN, "sendMessage", { chat_id: userId, text: "✅ 验证通过！\n现在您可以直接发送消息，我会帮您转达给管理员。" });
         }
@@ -560,7 +541,7 @@ async function verifyAnswer(id, ans, env) {
     } else await api(env.BOT_TOKEN, "sendMessage", { chat_id: id, text: "❌ 错误" });
 }
 
-// --- 8. 菜单与回调 ---
+// --- 7. 菜单与回调 ---
 async function handleCallback(cb, env) {
     const { data, message: msg, from } = cb;
     const [act, p1, p2, p3] = data.split(':');
@@ -687,7 +668,6 @@ async function handleAdminConfig(cid, mid, type, key, val, env) {
         }
         if (type === 'edit' || type === 'add') { 
             await setCfg(`admin_state:${cid}`, JSON.stringify({ action: 'input', key: key + (type==='add'?'_add':'') }), env);
-            // 提示语优化
             let promptText = `请输入 ${key} 的值 (/cancel 取消):`;
             if (key === 'ar' && type === 'add') {
                 promptText = `请输入自动回复规则，格式：\n<b>关键词===回复内容</b>\n\n例如：价格===请联系人工客服\n(/cancel 取消)`;
@@ -736,7 +716,6 @@ async function handleAdminInput(id, msg, state, env) {
     
     let k = state.key, val = txt;
     try {
-        // [新增] 媒体欢迎语配置逻辑
         if (k === 'welcome_msg') {
             if (msg.photo || msg.video || msg.animation) {
                 let fileId, type;
@@ -744,10 +723,8 @@ async function handleAdminInput(id, msg, state, env) {
                 else if (msg.video) { type = 'video'; fileId = msg.video.file_id; }
                 else if (msg.animation) { type = 'animation'; fileId = msg.animation.file_id; }
                 
-                // 存为 JSON 结构
                 val = JSON.stringify({ type: type, file_id: fileId, caption: msg.caption || "" });
             } else {
-                // 纯文本保持原样
                 val = txt;
             }
         }
@@ -771,7 +748,6 @@ async function handleAdminInput(id, msg, state, env) {
         
         await setCfg(k, val, env);
         await sql(env, "DELETE FROM config WHERE key=?", `admin_state:${id}`);
-        // 成功反馈：如果是 JSON (媒体配置)，不打印全部内容
         const displayVal = (val.startsWith('{') && k === 'welcome_msg') ? "[媒体配置]" : val.substring(0,100);
         await api(env.BOT_TOKEN, "sendMessage", { chat_id: id, text: `✅ ${k} 已更新:\n${displayVal}` });
         await handleAdminConfig(id, null, 'menu', null, null, env);
@@ -779,7 +755,7 @@ async function handleAdminInput(id, msg, state, env) {
     }
 }
 
-// --- 7. 工具 ---
+// --- 8. 工具 ---
 const getBool = async (k, e) => (await getCfg(k, e)) === 'true';
 const getJsonCfg = async (k, e) => { try { return JSON.parse(await getCfg(k, e))||[]; } catch { return [];
 } };
@@ -791,14 +767,25 @@ const isAuthAdmin = async (id, e) => {
     const list = await getJsonCfg('authorized_admins', e);
     return list.includes(idStr);
 };
+
+// 核心修改部分：重构 getUMeta 以适应新排版需求 (协议偷渡优化版)
 const getUMeta = (tgUser, dbUser, d) => {
-    const id = tgUser.id.toString(), name = (tgUser.first_name||"")+(tgUser.last_name?" "+tgUser.last_name:"");
+    const id = tgUser.id.toString();
+    const firstName = tgUser.first_name || "";
+    const lastName = tgUser.last_name || "";
+    let name = (firstName + " " + lastName).trim();
+    if (!name) name = "未命名用户";
+    const safeName = `<code>${escape(name)}</code>`; 
     const note = dbUser.user_info && dbUser.user_info.note ? `\n📝 <b>备注:</b> ${escape(dbUser.user_info.note)}` : "";
-    const userLink = tgUser.username ?
-        `<a href="tg://user?id=${id}">@${tgUser.username}</a>` : 
-        `<a href="tg://user?id=${id}">👤 ${escape(name)} (点击直达)</a>`; // [修复] 无用户名时的跳转链接
-    // 时区修正 (UTC+8)
+    const labelDisplay = tgUser.username ? `@${tgUser.username}` : "无用户名";
+    const linkDisplay = `<a href="tg://openmessage?user_id=${id}">打开主页</a>`;
     const timeStr = new Date(d*1000).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false });
-    return { userId: id, name, username: tgUser.username, topicName: `${name} |
-${id}`.substr(0, 128), card: `<b>👤 用户资料</b>\n---\n👤: <code>${escape(name)}</code>\n🔗: ${userLink}\n🆔: <code>${id}</code>${note}\n🕒: <code>${timeStr}</code>` };
+    
+    return { 
+        userId: id, 
+        name, 
+        username: tgUser.username, 
+        topicName: `${name} | ${id}`.substring(0, 128), 
+        card: `<b>🪪 用户资料</b>\n---\n👤: ${safeName}\n🏷️: ${labelDisplay}\n🆔: <code>${id}</code>\n🔗: ${linkDisplay}${note}\n🕒: <code>${timeStr}</code>` 
+    };
 };
