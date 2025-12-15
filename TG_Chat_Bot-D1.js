@@ -1,6 +1,6 @@
 /**
- * Telegram Bot Worker v3.60
- * 优化重点: 异常熔断、脏数据防御、并发逻辑优化
+ * Telegram Bot Worker v3.61 (Fixed Logic)
+ * 优化重点: 修复无头像用户话题渲染失败问题、优化数据库并发写入
  */
 
 // --- 1. 静态配置与常量 ---
@@ -50,7 +50,7 @@ export default {
         try {
             if (req.method === "GET") {
                 if (url.pathname === "/verify") return handleVerifyPage(url, env);
-                if (url.pathname === "/") return new Response("Bot v3.60 Hardened Active", { status: 200 });
+                if (url.pathname === "/") return new Response("Bot v3.61 Hardened Active", { status: 200 });
             }
             if (req.method === "POST") {
                 if (url.pathname === "/submit_token") return handleTokenSubmit(req, env);
@@ -387,7 +387,7 @@ async function handleVerifiedMsg(msg, u, env) {
     await relayToTopic(msg, u, env);
 }
 
-// 核心：消息转发与话题管理
+// 核心：消息转发与话题管理 (重构：优化顺序与并发写)
 async function relayToTopic(msg, u, env) {
     const uMeta = getUMeta(msg.from, u, msg.date), uid = u.user_id;
     let tid = u.topic_id;
@@ -434,7 +434,7 @@ async function relayToTopic(msg, u, env) {
         delete CACHE.user_locks[uid];
     }
 
-    // 2. 消息处理与哑消息清理
+    // 2. 消息处理与哑消息清理 (Fix: 先发卡片，再删哑消息，统一入库)
     try {
         // A. 转发用户消息
         await api(env.BOT_TOKEN, "forwardMessage", { 
@@ -444,16 +444,32 @@ async function relayToTopic(msg, u, env) {
             message_thread_id: tid 
         });
         
-        // B. 处理资料卡与哑消息 (使用局部 Try-Catch 确保不影响转发)
+        // B. 处理资料卡与哑消息
         try {
+            let infoDirty = false;
+
+            // 1. 优先发送/更新资料卡 (保证话题内有内容)
+            if (!u.user_info.card_msg_id) { 
+                const cardId = await sendInfoCardToTopic(env, u, msg.from, tid, msg.date);
+                if (cardId) {
+                    u.user_info.card_msg_id = cardId;
+                    u.user_info.join_date = msg.date || (Date.now()/1000);
+                    infoDirty = true;
+                }
+            }
+
+            // 2. 只有在确保有内容后，才清理哑消息
             if (u.user_info.dummy_msg_id) { 
                 await api(env.BOT_TOKEN, "deleteMessage", { chat_id: env.ADMIN_GROUP_ID, message_id: u.user_info.dummy_msg_id }).catch(() => {});
                 delete u.user_info.dummy_msg_id;
-                await updUser(uid, { user_info: u.user_info }, env);
+                infoDirty = true;
             }
-            if (!u.user_info.card_msg_id) { 
-                await sendInfoCardToTopic(env, u, msg.from, tid, msg.date);
+
+            // 3. 统一入库 (减少DB并发锁)
+            if (infoDirty) {
+                 await updUser(uid, { user_info: u.user_info }, env);
             }
+
         } catch (cardErr) {
             console.warn("Card/Dummy Msg Handling Error:", cardErr);
         }
@@ -480,6 +496,7 @@ async function relayToTopic(msg, u, env) {
     }
 }
 
+// Fix: 移除了内部 updUser，改为返回 ID；增加了置顶失败的容错
 async function sendInfoCardToTopic(env, u, tgUser, tid, date) {
     const meta = getUMeta(tgUser, u, date || (Date.now()/1000));
     try {
@@ -487,12 +504,18 @@ async function sendInfoCardToTopic(env, u, tgUser, tid, date) {
             chat_id: env.ADMIN_GROUP_ID, message_thread_id: tid, text: meta.card, parse_mode: "HTML", 
             reply_markup: getBtns(u.user_id, u.is_blocked) 
         });
-        await api(env.BOT_TOKEN, "pinChatMessage", { chat_id: env.ADMIN_GROUP_ID, message_id: card.message_id, message_thread_id: tid });
-        await updUser(u.user_id, { user_info: { ...u.user_info, card_msg_id: card.message_id, join_date: date } }, env);
-        return true;
+        
+        // 独立 try-catch，置顶失败不影响流程
+        try {
+            await api(env.BOT_TOKEN, "pinChatMessage", { chat_id: env.ADMIN_GROUP_ID, message_id: card.message_id, message_thread_id: tid });
+        } catch (pinErr) {
+            console.warn("Pin failed (non-fatal):", pinErr);
+        }
+        
+        return card.message_id;
     } catch (e) { 
         console.error("Send Info Card Failed:", e);
-        return false; 
+        return null; 
     } 
 }
 
@@ -592,7 +615,11 @@ async function handleAdminReply(msg, env) {
                     });
                     updated = true; 
                 } catch {}
-                if (!updated) await sendInfoCardToTopic(env, u, mockTgUser, u.topic_id, u.user_info.join_date);
+                // 如果更新失败，或没有卡片ID，则发送新卡片
+                if (!updated) {
+                     const cid = await sendInfoCardToTopic(env, u, mockTgUser, u.topic_id, u.user_info.join_date);
+                     if(cid) u.user_info.card_msg_id = cid;
+                }
             }
             
             // 同步更新未读列表
