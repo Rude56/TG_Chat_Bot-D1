@@ -1,11 +1,29 @@
 /**
  * Telegram Bot Worker v3.70+
  * 架构: Cloudflare Workers + D1 Database
- * 需要新增环境变量：
- * 变量名称：`TELEGRAM_WEBHOOK_SECRET` | 值：直接生成随机字符即可
  *
- * 可选调参（无需 env）：
- * - 见下方常量区：限流阈值、TTL、regex 安全策略等
+ * ✅ P0:
+ * - Webhook secret_token 校验（拒绝非 Telegram）
+ * - /submit_token 强制 initData 验签（不信任 userId）
+ * - 管理员鉴权 Set 精确匹配（避免 includes 子串误判）
+ * - 话题创建分布式幂等（D1 抢锁）
+ *
+ * ✅ P1:
+ * - update 幂等去重（processed_updates）
+ * - 全局/单用户限流（ratelimits，使用 RETURNING 降低 round trips）
+ * - TG API 重试与退避（429/5xx/网络异常）
+ * - 话题轮询指数退避 + 抖动，降低 D1 压力
+ *
+ * ✅ P2:
+ * - 正则 ReDoS 缓解：限制输入长度 + 拒绝高风险 regex 形态
+ * - messages 表 TTL 清理（默认保留 30 天），异步概率触发
+ *
+ * ✅ 修复：
+ * - 屏蔽用户不再“/start 自愈解封”；屏蔽后无法再发送消息触达管理员
+ * - 新增管理员私聊命令：/reset <id> 强制用户重新验证
+ *
+ * 需要新增环境变量：
+ * - TELEGRAM_WEBHOOK_SECRET: Telegram setWebhook 的 secret_token（请求头 X-Telegram-Bot-Api-Secret-Token）
  */
 
 // --- 1. 静态配置与常量 ---
@@ -96,14 +114,10 @@ const MESSAGES_TTL_DAYS = 30;
 const REGEX_MAX_PATTERN_LEN = 256;
 const REGEX_MAX_TEXT_LEN = 512; // 仅对前 512 字符做 regex test，降低灾难性回溯伤害
 const REGEX_REJECT_PATTERNS = [
-  // “分组 + 量词” 很容易产生灾难性回溯： ( ... )+  ( ... )*  ( ... ){m,n}
   /\([^)]*\)\s*[+*{]/,
-  // 明显的 (.*)+ / (.+)+
   /\(\s*\.\*\s*\)\s*\+/,
   /\(\s*\.\+\s*\)\s*\+/,
-  // 反向引用也易导致高复杂度
   /\\[1-9]/,
-  // lookbehind 在部分实现中开销更大，直接禁掉（保守）
   /\(\?<=[\s\S]*\)/,
   /\(\?<![\s\S]*\)/
 ];
@@ -133,7 +147,7 @@ export default {
     try {
       if (req.method === "GET") {
         if (url.pathname === "/verify") return handleVerifyPage(url, env);
-        if (url.pathname === "/") return new Response("Bot v3.70+ (Hardened P0+P1+P2)", { status: 200 });
+        if (url.pathname === "/") return new Response("Bot v3.70+ (Hardened + Block Fix + /reset)", { status: 200 });
       }
 
       if (req.method === "POST") {
@@ -150,7 +164,7 @@ export default {
 
           // update 幂等去重（P1）
           const ok = await markUpdateOnce(update, env, ctx);
-          if (!ok) return new Response("OK"); // 已处理过，直接返回 OK
+          if (!ok) return new Response("OK");
 
           ctx.waitUntil(handleUpdate(update, env, ctx));
           return new Response("OK");
@@ -297,14 +311,12 @@ async function dbInit(env) {
     )`),
     env.TG_BOT_DB.prepare(`CREATE INDEX IF NOT EXISTS idx_messages_date ON messages(date)`),
 
-    // 幂等表：处理过的 update
     env.TG_BOT_DB.prepare(`CREATE TABLE IF NOT EXISTS processed_updates (
       update_id TEXT PRIMARY KEY,
       ts INTEGER
     )`),
     env.TG_BOT_DB.prepare(`CREATE INDEX IF NOT EXISTS idx_processed_updates_ts ON processed_updates(ts)`),
 
-    // 限流表（同时用于 submit_token 限流）
     env.TG_BOT_DB.prepare(`CREATE TABLE IF NOT EXISTS ratelimits (
       key TEXT PRIMARY KEY,
       ts INTEGER,
@@ -421,7 +433,6 @@ async function markUpdateOnce(update, env, ctx) {
     const changes = res?.meta?.changes ?? res?.changes ?? 0;
     if (!changes) return false;
 
-    // 概率触发 + 最小间隔清理
     if ((now % 97) === 7) {
       maybeCleanup(ctx, "processed_updates_ts", async () => {
         const cutoff = now - PROCESSED_UPDATES_TTL_MS;
@@ -431,13 +442,11 @@ async function markUpdateOnce(update, env, ctx) {
 
     return true;
   } catch {
-    return true; // 幂等失败：保守放行避免误伤
+    return true;
   }
 }
 
-// 利用 SQLite RETURNING 将“写+读”合并为一次 D1 round trip
 async function bumpRateKey(env, key, now) {
-  // 注意：RETURNING 需要 SQLite >= 3.35；D1 通常满足。若未来不支持，stmt.first() 可能返回 null。
   const q = `
     INSERT INTO ratelimits (key, ts, count) VALUES (?, ?, 1)
     ON CONFLICT(key) DO UPDATE SET count = ratelimits.count + 1, ts = excluded.ts
@@ -448,7 +457,6 @@ async function bumpRateKey(env, key, now) {
   return c;
 }
 
-// 私聊消息限流（跨实例）
 async function checkRateLimit(userId, env, ctx) {
   const now = Date.now();
   const uid = userId?.toString() || "";
@@ -460,7 +468,6 @@ async function checkRateLimit(userId, env, ctx) {
   const userKey = `u:${uid}:${userBucket}`;
   const globalKey = `g:${globalBucket}`;
 
-  // 两次 D1 操作（各 1 次 RETURNING），比原先 4 次更省
   const [uc, gc] = await Promise.all([bumpRateKey(env, userKey, now), bumpRateKey(env, globalKey, now)]);
 
   if ((now % 101) === 13) {
@@ -476,7 +483,6 @@ async function checkRateLimit(userId, env, ctx) {
   return { allowed: true, retryAfterMs: 0 };
 }
 
-// /submit_token 限流：优先按 uid，其次按 IP
 async function checkSubmitRateLimit(req, env, ctx, uidMaybe) {
   const now = Date.now();
   const ip = (req.headers.get("CF-Connecting-IP") || req.headers.get("X-Forwarded-For") || "").split(",")[0].trim() || "0.0.0.0";
@@ -502,7 +508,6 @@ async function checkSubmitRateLimit(req, env, ctx, uidMaybe) {
   return { allowed: true };
 }
 
-// messages TTL 清理（异步、低频）
 function maybeCleanupMessages(env, ctx) {
   const now = Date.now();
   if ((now % 131) !== 11) return;
@@ -566,6 +571,23 @@ async function handlePrivate(msg, env, ctx) {
   const text = msg.text || "";
   const isStart = text.startsWith("/start");
 
+  // ✅ 修复：屏蔽必须生效（不再 /start 自愈解封）
+  // 先取用户，保证 block 生效是 DB 真实状态
+  const u0 = await getUser(id, env);
+  if (u0.is_blocked && !(await isAuthAdmin(id, env))) {
+    // 降噪：10 秒内只提示一次
+    const bk = `blocked_notice:${id}`;
+    if (!CACHE.locks.has(bk)) {
+      CACHE.locks.add(bk);
+      setTimeout(() => CACHE.locks.delete(bk), 10000);
+      api(env.BOT_TOKEN, "sendMessage", {
+        chat_id: id,
+        text: "🚫 您已被管理员屏蔽，无法发送消息。如有误判请联系管理员解除。"
+      }).catch(() => {});
+    }
+    return;
+  }
+
   // 限流（非管理员）
   if (!(await isAuthAdmin(id, env))) {
     const rl = await checkRateLimit(id, env, ctx);
@@ -580,6 +602,25 @@ async function handlePrivate(msg, env, ctx) {
     }
   }
 
+  // ✅ 新增：Primary Admin 私聊命令 /reset <id>
+  if (text.startsWith("/reset") && (await isPrimaryAdmin(id, env))) {
+    const parts = text.trim().split(/\s+/);
+    const target = (parts[1] || "").trim();
+    if (!target || !/^\d+$/.test(target)) {
+      return api(env.BOT_TOKEN, "sendMessage", {
+        chat_id: id,
+        text: "用法：/reset <user_id>\n示例：/reset 123456789"
+      });
+    }
+    await forceResetUserVerify(target, env);
+    // 通知目标用户（失败静默）
+    api(env.BOT_TOKEN, "sendMessage", {
+      chat_id: target,
+      text: "⚠️ 管理员要求您重新验证。\n请发送 /start 重新完成验证流程。"
+    }).catch(() => {});
+    return api(env.BOT_TOKEN, "sendMessage", { chat_id: id, text: `✅ 已重置用户 ${target} 的验证状态。` });
+  }
+
   // 管理员命令优先
   if (isStart) {
     if (await isPrimaryAdmin(id, env)) {
@@ -591,22 +632,13 @@ async function handlePrivate(msg, env, ctx) {
   if (text === "/help" && (await isAuthAdmin(id, env))) {
     return api(env.BOT_TOKEN, "sendMessage", {
       chat_id: id,
-      text: "ℹ️ <b>帮助</b>\n• 回复消息即对话\n• /start 打开面板",
+      text: "ℹ️ <b>帮助</b>\n• 回复消息即对话\n• /start 打开面板\n• /reset <id> 重置用户验证(仅主管理员)",
       parse_mode: "HTML"
     });
   }
 
-  const u = await getUser(id, env);
-
-  // 解封自愈：/start 解封
-  if (u.is_blocked) {
-    if (isStart) {
-      await updUser(id, { is_blocked: 0, block_count: 0 }, env);
-      await manageBlacklist(env, u, msg.from, false);
-      return sendStart(id, msg, env);
-    }
-    return;
-  }
+  // 继续使用 u0，避免重复读
+  const u = u0;
 
   // 管理员免验证
   if (await isAuthAdmin(id, env)) {
@@ -652,9 +684,28 @@ async function handlePrivate(msg, env, ctx) {
   await handleVerifiedMsg(msg, u, env, ctx);
 }
 
+// ✅ 强制重置用户验证状态（不解封、不改 topic_id）
+async function forceResetUserVerify(userId, env) {
+  const uid = userId.toString();
+  // 清掉 nonce 并回到 new
+  // user_info_json 是 JSON 字符串：用 mergeUserInfo 方式安全更新
+  await updUser(uid, {
+    user_state: "new",
+    user_info: { verify_nonce: "", verify_nonce_ts: 0 }
+  }, env);
+}
+
 // --- 9. Start 流程（确保验证弹出 + nonce） ---
 async function sendStart(id, msg, env) {
   const u = await getUser(id, env);
+
+  // 若用户被屏蔽（保险校验）
+  if (u.is_blocked && !(await isAuthAdmin(id, env))) {
+    return api(env.BOT_TOKEN, "sendMessage", {
+      chat_id: id,
+      text: "🚫 您已被管理员屏蔽，无法使用本 Bot。"
+    }).catch(() => {});
+  }
 
   if (u.user_state === "verified") {
     if (u.topic_id) {
@@ -708,20 +759,28 @@ async function sendStart(id, msg, env) {
   if (vOn && url) {
     const nonce = genNonce(24);
     const now = Date.now();
-    await updUser(id, {
-      user_state: "pending_turnstile",
-      user_info: { verify_nonce: nonce, verify_nonce_ts: now }
-    }, env);
+    await updUser(
+      id,
+      {
+        user_state: "pending_turnstile",
+        user_info: { verify_nonce: nonce, verify_nonce_ts: now }
+      },
+      env
+    );
 
     await api(env.BOT_TOKEN, "sendMessage", {
       chat_id: id,
       text: "🛡️ <b>安全验证</b>\n请点击下方按钮完成人机验证以继续。",
       parse_mode: "HTML",
       reply_markup: {
-        inline_keyboard: [[{
-          text: "点击进行验证",
-          web_app: { url: `${url}/verify?user_id=${encodeURIComponent(id)}&nonce=${encodeURIComponent(nonce)}` }
-        }]]
+        inline_keyboard: [
+          [
+            {
+              text: "点击进行验证",
+              web_app: { url: `${url}/verify?user_id=${encodeURIComponent(id)}&nonce=${encodeURIComponent(nonce)}` }
+            }
+          ]
+        ]
       }
     });
   } else if (qaOn) {
@@ -740,9 +799,13 @@ async function sendStart(id, msg, env) {
 // --- 10. 已验证用户逻辑 ---
 async function handleVerifiedMsg(msg, u, env, ctx) {
   const id = u.user_id;
+
+  // 保险：若中途被屏蔽（并发情况下），直接终止
+  if (u.is_blocked && !(await isAuthAdmin(id, env))) return;
+
   const text = msg.text || msg.caption || "";
 
-  // A. 屏蔽词检测（ReDoS 缓解：限制文本长度 + 风险模式拒绝）
+  // A. 屏蔽词检测（ReDoS 缓解）
   if (text) {
     const kws = await getJsonCfg("block_keywords", env);
     const hit = (Array.isArray(kws) ? kws : []).some(k => safeRegexTest(k, text));
@@ -786,13 +849,17 @@ async function handleVerifiedMsg(msg, u, env, ctx) {
     }
   }
 
-  // E. 转发（首次有效消息才会创建话题）
+  // E. 转发
   await relayToTopic(msg, u, env, ctx);
 }
 
 // --- 11. 转发到话题（D1 分布式幂等 + 指数退避轮询） ---
 async function relayToTopic(msg, u, env, ctx) {
   const uid = u.user_id;
+
+  // 保险：若中途被屏蔽（并发情况下），直接终止
+  if (u.is_blocked && !(await isAuthAdmin(uid, env))) return;
+
   const uMeta = getUMeta(msg.from, u, msg.date);
   let tid = u.topic_id;
 
@@ -834,9 +901,8 @@ async function relayToTopic(msg, u, env, ctx) {
         else return api(env.BOT_TOKEN, "sendMessage", { chat_id: uid, text: "⚠️ 系统繁忙，请稍后重试" });
       }
     } else {
-      // 指数退避 + 抖动，降低 D1 压力
       for (let i = 0; i < TOPIC_LOCK_POLL_MAX; i++) {
-        const delay = Math.min(1500, TOPIC_LOCK_POLL_BASE_MS * Math.pow(2, i)) + (Math.floor(Math.random() * 60));
+        const delay = Math.min(1500, TOPIC_LOCK_POLL_BASE_MS * Math.pow(2, i)) + Math.floor(Math.random() * 60);
         await sleep(delay);
 
         const fresh = await getUser(uid, env);
@@ -887,7 +953,6 @@ async function relayToTopic(msg, u, env, ctx) {
   }
 
   if (relaySuccess) {
-    // 用户侧：仅 reaction，失败静默（去重 20s）
     const dk = `delivered:${uid}:${msg.message_id}`;
     if (!CACHE.locks.has(dk)) {
       CACHE.locks.add(dk);
@@ -904,7 +969,6 @@ async function relayToTopic(msg, u, env, ctx) {
           msg.date
         ]);
       } catch {}
-      // messages TTL 清理（异步）
       maybeCleanupMessages(env, ctx);
     }
 
@@ -1084,52 +1148,47 @@ async function handleTokenSubmit(req, env, ctx) {
   try {
     const body = await req.json();
     const token = body?.token;
-    const uiUserId = (body?.userId || "").toString(); // 仅用于一致性检查
+    const uiUserId = (body?.userId || "").toString();
     const nonce = (body?.nonce || "").toString();
     const initData = (body?.initData || "").toString();
     const mode = await getCfg("captcha_mode", env);
 
-    // 先做 IP 级限流（即便 initData 伪造也先压住）
+    // 先做 IP 级限流
     const rlPre = await checkSubmitRateLimit(req, env, ctx, "");
     if (!rlPre.allowed) throw new Error("Rate limited");
 
-    // 1) 必须有 initData 且必须验签成功（uid 来自 initData）
+    // 必须 initData 且验签成功
     if (!initData || initData.length < 20) throw new Error("Missing initData");
     const parsed = await verifyTelegramInitData(initData, env.BOT_TOKEN, 600);
     const uid = parsed?.userId?.toString();
     if (!uid) throw new Error("Missing uid");
 
-    // uid 级限流（更严格）
+    // uid 级限流
     const rlUid = await checkSubmitRateLimit(req, env, ctx, uid);
     if (!rlUid.allowed) throw new Error("Rate limited");
 
-    // UI user_id 若提供，必须匹配
-    if (uiUserId && uiUserId !== uid) {
-      console.warn("submit_token uid mismatch", { uiUserId, uid });
-      throw new Error("uid mismatch");
-    }
+    if (uiUserId && uiUserId !== uid) throw new Error("uid mismatch");
 
-    // 2) 校验 nonce：必须匹配用户 pending_turnstile 时保存的 nonce
     const u = await getUser(uid, env);
+
+    // 屏蔽用户不允许验证推进
+    if (u.is_blocked && !(await isAuthAdmin(uid, env))) throw new Error("blocked");
+
     const savedNonce = (u.user_info?.verify_nonce || "").toString();
     const savedTs = Number(u.user_info?.verify_nonce_ts || 0);
     const now = Date.now();
     const expired = !savedTs || now - savedTs > VERIFY_NONCE_TTL_MS;
 
-    // 已验证：直接成功（避免重复发消息）
     if (u.user_state === "verified") {
       return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
     }
 
-    // 仅当启用验证码才要求 nonce 完整
     const vOn = await getBool("enable_verify", env);
     if (vOn) {
       if (!nonce || !savedNonce || expired || nonce !== savedNonce) throw new Error("nonce invalid");
-      // nonce 一次性：清掉
       await updUser(uid, { user_info: { verify_nonce: "", verify_nonce_ts: 0 } }, env);
     }
 
-    // 3) 验证 captcha token（外部调用，放在所有本地校验之后）
     const verifyUrl =
       mode === "recaptcha"
         ? "https://www.google.com/recaptcha/api/siteverify"
@@ -1149,7 +1208,6 @@ async function handleTokenSubmit(req, env, ctx) {
     const d = await r.json();
     if (!d.success) throw new Error("Token Invalid");
 
-    // 4) 存用户档案（不影响方案 S）
     try {
       if (parsed?.userObj) {
         const nm = ((parsed.userObj.first_name || "") + " " + (parsed.userObj.last_name || "")).trim() || (parsed.userObj.first_name || "");
@@ -1161,7 +1219,6 @@ async function handleTokenSubmit(req, env, ctx) {
       }
     } catch {}
 
-    // 5) 推进状态
     const qaOn = await getBool("enable_qa_verify", env);
     if (qaOn) {
       await updUser(uid, { user_state: "pending_verification" }, env);
@@ -1271,7 +1328,6 @@ function escapeHTML(t) {
     .replace(/'/g, "&#39;");
 }
 
-// ReDoS 缓解：限制 pattern、限制 text 长度、拒绝高风险形态
 function safeRegexTest(pattern, text) {
   try {
     if (!pattern || typeof pattern !== "string") return false;
@@ -1285,7 +1341,6 @@ function safeRegexTest(pattern, text) {
     const t = (text || "").toString();
     const t2 = t.length > REGEX_MAX_TEXT_LEN ? t.slice(0, REGEX_MAX_TEXT_LEN) : t;
 
-    // 禁止 “u” 与复杂特性，保持简单；gi 保持原有行为
     return new RegExp(p, "gi").test(t2);
   } catch {
     return false;
@@ -1336,7 +1391,7 @@ async function registerCommands(env) {
 
     for (const id of uniqueAdmins) {
       await api(env.BOT_TOKEN, "setMyCommands", {
-        commands: [{ command: "start", description: "面板" }, { command: "help", description: "帮助" }],
+        commands: [{ command: "start", description: "面板" }, { command: "help", description: "帮助" }, { command: "reset", description: "重置用户验证(主管理员)" }],
         scope: { type: "chat", chat_id: id }
       });
     }
