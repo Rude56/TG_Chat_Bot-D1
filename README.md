@@ -159,4 +159,4 @@ https://api.telegram.org/bot<你的BOT_TOKEN>/setWebhook?url=<你的WORKER_URL>/
 > 遇到问题？请在 [Issues](https://github.com/huliyoudiangou/TG_Chat_Bot-D1/issues) 提交详细日志，我们将快速响应！  
 
 **🌟 给项目一个 Star 吧！您的支持是我们持续更新的动力！**  
-[![GitHub stars](https://img.shields.io/github/stars/your-repo/telegram-cf-worker?style=social)](https://github.com/huliyoudiangou/TG_Chat_Bot-D1)
+[![GitHub stars](https://img.shields.io/github/stars/your-repo/telegram-cf-worker?style=social)](https://github.com/Rude56/TG_Chat_Bot-D1)
