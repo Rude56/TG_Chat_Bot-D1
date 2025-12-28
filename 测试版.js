@@ -1146,8 +1146,7 @@ async function handleAdminConfig(cid, mid, type, key, val, env) {
         inline_keyboard: [  
           [{ text: "📝 基础", callback_data: "config:menu:base" }, { text: "🤖 自动回复", callback_data: "config:menu:ar" }],  
           [{ text: "🚫 屏蔽词", callback_data: "config:menu:kw" }, { text: "🛠 过滤", callback_data: "config:menu:fl" }],  
-          [{ text: "👮 协管", callback_data: "config:menu:auth" }, { text: "🔔 通知话题", callback_data: "config:menu:bak" }],  
-          [{ text: "🌙 就寝时间", callback_data: "config:menu:sleep" }]  
+          [{ text: "👮 协管", callback_data: "config:menu:auth" }, { text: "🌙 就寝时间", callback_data: "config:menu:sleep" }],  
         ]  
       });  
       if (key === "base") {  
