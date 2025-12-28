@@ -1,10 +1,6 @@
 /**  
-* Telegram Bot Worker v3.85 (完整增强版 - 修复补全)  
-* 基于 v3.70+ 架构，集成引用同步、双向撤回、编辑同步  
-*  
-* 修改记录:
-* 1. 菜单更新: 用户和管理员均可使用 /del 菜单。
-* 2. 交互优化: 用户发送 /del 未回复消息时给予提示。
+* Telegram Bot Worker v3.85 (Customized)
+* 已移除备份功能，新增自动化就寝时间功能
 */  
   
 // --- 1. 静态配置与常量 ---  
@@ -50,12 +46,14 @@ const DEFAULTS = {
   enable_audio_forwarding: "true",  
   enable_sticker_forwarding: "true",  
   
-  // 话题与列表  
-  backup_group_id: "",  
+  // 话题与列表 (已移除 backup_group_id)
   unread_topic_id: "",  
   blocked_topic_id: "",  
-  busy_mode: "false",  
-  busy_msg: "当前是非营业时间,消息已收到,管理员稍后回复。",  
+  // 就寝时间功能
+  enable_sleep_mode: "false",  
+  sleep_start: "23:00",
+  sleep_end: "07:00",
+  sleep_msg: "当前是管理员就寝时间，消息已收到，管理员醒后会第一时间回复。",  
   block_keywords: "[]",  
   keyword_responses: "[]",  
   authorized_admins: "[]"  
@@ -115,7 +113,7 @@ export default {
     try {  
       if (req.method === "GET") {  
         if (url.pathname === "/verify") return handleVerifyPage(url, env);  
-        if (url.pathname === "/") return new Response("Bot v3.85 (Sync+Recall+Edit)", { status: 200 });  
+        if (url.pathname === "/") return new Response("Bot v3.85 (Sleep Mode Active)", { status: 200 });  
       }  
   
       if (req.method === "POST") {  
@@ -242,8 +240,6 @@ async function dbInit(env) {
     env.TG_BOT_DB.prepare(`CREATE INDEX IF NOT EXISTS idx_processed_updates_ts ON processed_updates(ts)`),  
     env.TG_BOT_DB.prepare(`CREATE TABLE IF NOT EXISTS ratelimits (key TEXT PRIMARY KEY, ts INTEGER, count INTEGER)`),  
     env.TG_BOT_DB.prepare(`CREATE INDEX IF NOT EXISTS idx_ratelimits_ts ON ratelimits(ts)`),  
-      
-    // 消息映射表 (用于引用同步和撤回)  
     env.TG_BOT_DB.prepare(`CREATE TABLE IF NOT EXISTS msg_mapping (  
       user_id TEXT, user_msg_id TEXT, admin_msg_id TEXT, ts INTEGER, PRIMARY KEY (user_id, user_msg_id)  
     )`),  
@@ -399,21 +395,18 @@ async function handleUpdate(update, env, ctx) {
   const msg = update.message || update.edited_message;  
   if (!msg) return update.callback_query ? handleCallback(update.callback_query, env) : null;  
   
-  // 1. 撤回指令: 回复消息并发送 /del (message)  
   if (update.message && msg.text === "/del" && msg.reply_to_message) {  
     return handleDeleteSync(msg, env);  
   }  
 
-  // --- [修改点] 1.1 撤回指令提示: 用户发送 /del 但未回复消息 ---
   if (update.message && msg.text === "/del" && !msg.reply_to_message) {
     return api(env.BOT_TOKEN, "sendMessage", { 
       chat_id: msg.chat.id, 
-      text: "⚠️ <b>使用提示:</b>\n请先<b>回复</b>(长按或右键)您要撤回的那条消息，然后发送 <code>/del</code>", 
+      text: "<b>⚠️ 使用提示:</b>\n引用你要撤回的消息,然后发送 /del", 
       parse_mode: "HTML"
     });
   }
     
-  // 2. 编辑同步 (edited_message)  
   if (update.edited_message) {  
     return handleEditSync(update.edited_message, env);  
   }  
@@ -582,7 +575,7 @@ async function sendStart(id, msg, env) {
   }  
 }  
   
-// --- 10. 已验证用户逻辑 ---  
+// --- 10. 已验证用户逻辑 (新增自动化就寝判定) ---  
 async function handleVerifiedMsg(msg, u, env, ctx) {  
   const id = u.user_id;  
   if (u.is_blocked && !(await isAuthAdmin(id, env))) return;  
@@ -617,18 +610,33 @@ async function handleVerifiedMsg(msg, u, env, ctx) {
     if (match) api(env.BOT_TOKEN, "sendMessage", { chat_id: id, text: match.response }).catch(() => {});  
   }  
   
-  if (await getBool("busy_mode", env)) {  
-    const now = Date.now();  
-    if (now - (u.user_info.last_busy_reply || 0) > 300000) {  
-      api(env.BOT_TOKEN, "sendMessage", { chat_id: id, text: "🌙 " + (await getCfg("busy_msg", env)) }).catch(() => {});  
-      await updUser(id, { user_info: { last_busy_reply: now } }, env);  
-    }  
+  // 就寝时间逻辑 (自动化)
+  if (await getBool("enable_sleep_mode", env)) {  
+    const now = new Date();
+    const currentTime = now.toLocaleTimeString('zh-CN', { hour12: false, timeZone: 'Asia/Shanghai' }).slice(0, 5);
+    const start = await getCfg("sleep_start", env);
+    const end = await getCfg("sleep_end", env);
+    
+    let isSleeping = false;
+    if (start <= end) {
+      isSleeping = (currentTime >= start && currentTime <= end);
+    } else {
+      isSleeping = (currentTime >= start || currentTime <= end); // 跨天
+    }
+
+    if (isSleeping) {
+      const nowTs = Date.now();  
+      if (nowTs - (u.user_info.last_sleep_reply || 0) > 300000) {  
+        api(env.BOT_TOKEN, "sendMessage", { chat_id: id, text: "🌙 " + (await getCfg("sleep_msg", env)) }).catch(() => {});  
+        await updUser(id, { user_info: { last_sleep_reply: nowTs } }, env);  
+      }  
+    }
   }  
   
   await relayToTopic(msg, u, env, ctx);  
 }  
   
-// --- 11. 转发到话题 (集成引用同步 + 映射) ---  
+// --- 11. 转发到话题 (已移除备份调用) ---  
 async function relayToTopic(msg, u, env, ctx) {  
   const uid = u.user_id;  
   if (u.is_blocked && !(await isAuthAdmin(uid, env))) return;  
@@ -671,11 +679,8 @@ async function relayToTopic(msg, u, env, ctx) {
   
   if (!tid) return;  
   
-  // --- 引用同步与消息转发 ---  
   let relaySuccess = false;  
   let sentMsgId = null;  
-  
-  // 检查是否回复了某条消息  
   let replyToIdInAdmin = null;  
   if (msg.reply_to_message) {  
     try {  
@@ -686,7 +691,6 @@ async function relayToTopic(msg, u, env, ctx) {
   }  
   
   try {  
-    // 使用 copyMessage 以支持 reply_to_message_id  
     const extra = {};  
     if (msg.text) extra.text = msg.text;  
     if (msg.caption) extra.caption = msg.caption;  
@@ -703,12 +707,10 @@ async function relayToTopic(msg, u, env, ctx) {
     if (res && res.message_id) {  
       sentMsgId = res.message_id;  
       relaySuccess = true;  
-      // 写入映射表  
       await sql(env, "INSERT OR REPLACE INTO msg_mapping (user_id, user_msg_id, admin_msg_id, ts) VALUES (?, ?, ?, ?)",  
         [uid, msg.message_id.toString(), sentMsgId.toString(), Date.now()]);  
     }  
   } catch (cpErr) {  
-    console.error("Copy Failed:", cpErr);  
     if (cpErr.message && (cpErr.message.includes("thread") || cpErr.message.includes("not found"))) {  
       await updUser(uid, { topic_id: null }, env);  
       return api(env.BOT_TOKEN, "sendMessage", { chat_id: uid, text: "⚠️ 会话已过期,请重发" });  
@@ -729,7 +731,7 @@ async function relayToTopic(msg, u, env, ctx) {
       } catch {}  
       maybeCleanupMessages(env, ctx);  
     }  
-    await Promise.all([handleInbox(env, msg, u, tid, uMeta), handleBackup(msg, uMeta, env)]);  
+    await handleInbox(env, msg, u, tid, uMeta);  
   }  
 }  
   
@@ -795,7 +797,7 @@ async function handleInbox(env, msg, u, tid, uMeta) {
   }  
 }  
   
-// --- 14. 黑名单/备份 ---  
+// --- 14. 黑名单 ---  
 async function manageBlacklist(env, u, tgUser, isBlocking) {  
   let bid = await getCfg("blocked_topic_id", env);  
   if (!bid && isBlocking) {  
@@ -819,16 +821,6 @@ async function manageBlacklist(env, u, tgUser, isBlocking) {
       api(env.BOT_TOKEN, "deleteMessage", { chat_id: env.ADMIN_GROUP_ID, message_id: u.user_info.blacklist_msg_id }).catch(() => {});  
       await updUser(u.user_id, { user_info: { blacklist_msg_id: null } }, env);  
     }  
-  }  
-}  
-  
-async function handleBackup(msg, meta, env) {  
-  const bid = await getCfg("backup_group_id", env);  
-  if (!bid) return;  
-  try {  
-    await api(env.BOT_TOKEN, "copyMessage", { chat_id: bid, from_chat_id: msg.chat.id, message_id: msg.message_id });  
-  } catch {  
-    if (msg.text) api(env.BOT_TOKEN, "sendMessage", { chat_id: bid, text: `<b>备份</b> ${escapeHTML(meta.name)}:\n${escapeHTML(msg.text)}`, parse_mode: "HTML" }).catch(() => {});  
   }  
 }  
   
@@ -916,16 +908,18 @@ async function handleTokenSubmit(req, env, ctx) {
         if (nm) patch.name = nm;  
         if (parsed.userObj.username) patch.username = parsed.userObj.username.toString();  
         if (parsed.authDate) patch.join_date = parsed.authDate;  
-        if (Object.keys(patch).length) await updUser(uid, { user_info: patch }, env);  
-      }  
-    } catch {}  
+        if (Object.keys(patch).length) await updUser(uid, { user_state: "verified", user_info: patch }, env);  
+        else await updUser(uid, { user_state: "verified" }, env);
+      } else {
+        await updUser(uid, { user_state: "verified" }, env);
+      }
+    } catch { await updUser(uid, { user_state: "verified" }, env); }  
   
     const qaOn = await getBool("enable_qa_verify", env);  
     if (qaOn) {  
       await updUser(uid, { user_state: "pending_verification" }, env);  
       await api(env.BOT_TOKEN, "sendMessage", { chat_id: uid, text: "✅ 验证通过!\n请继续回答:\n" + (await getCfg("verif_q", env)) });  
     } else {  
-      await updUser(uid, { user_state: "verified" }, env);  
       await api(env.BOT_TOKEN, "sendMessage", { chat_id: uid, text: "✅ 验证通过!\n请直接发送消息以联系管理员。" });  
     }  
     return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });  
@@ -1024,17 +1018,13 @@ const getBtns = (id, blk) => ({ inline_keyboard: [[{ text: "👤 主页", url: `
 async function registerCommands(env) {  
   try {  
     await api(env.BOT_TOKEN, "deleteMyCommands", { scope: { type: "default" } });  
-    
-    // --- [修改点] 设置默认用户的菜单 (普通用户: Start + Del) ---
     await api(env.BOT_TOKEN, "setMyCommands", { 
       commands: [
-        { command: "start", description: "开始 / Start" },
-        { command: "del", description: "撤回 (需回复) / Recall" } 
+        { command: "start", description: "开始" },
+        { command: "del", description: "撤回(需引用)" } 
       ], 
       scope: { type: "default" } 
     });  
-
-    // 设置管理员菜单
     const admins = [...(env.ADMIN_IDS || "").split(/[,,]/), ...(await getJsonCfg("authorized_admins", env))];  
     const uniqueAdmins = [...new Set(admins.map(i => i.toString().trim()).filter(Boolean))];  
     for (const id of uniqueAdmins) {  
@@ -1094,7 +1084,7 @@ async function handleCallback(cb, env) {
   }  
 }  
   
-// --- 20. 管理员回复 (集成引用同步 + 映射) ---  
+// --- 20. 管理员回复 ---  
 async function handleAdminReply(msg, env) {  
   if (!msg.message_thread_id || msg.from.is_bot || !(await isAuthAdmin(msg.from.id, env))) return;  
   
@@ -1119,7 +1109,6 @@ async function handleAdminReply(msg, env) {
   const uid = (await sql(env, "SELECT user_id FROM users WHERE topic_id = ?", msg.message_thread_id.toString(), "first"))?.user_id;  
   if (!uid) return;  
   
-  // --- 管理员回复引用映射 ---  
   let replyToIdInUser = null;  
   if (msg.reply_to_message) {  
     try {  
@@ -1134,11 +1123,10 @@ async function handleAdminReply(msg, env) {
       chat_id: uid,  
       from_chat_id: msg.chat.id,  
       message_id: msg.message_id,  
-      reply_to_message_id: replyToIdInUser // 关联引用  
+      reply_to_message_id: replyToIdInUser  
     });  
       
     if (sent && sent.message_id) {  
-      // 写入映射  
       await sql(env, "INSERT OR REPLACE INTO msg_mapping (user_id, user_msg_id, admin_msg_id, ts) VALUES (?, ?, ?, ?)",  
         [uid, sent.message_id.toString(), msg.message_id.toString(), Date.now()]);  
     }  
@@ -1147,7 +1135,7 @@ async function handleAdminReply(msg, env) {
   }  
 }  
   
-// --- 21. 面板 ---  
+// --- 21. 面板 (已移除备份配置，增加就寝时间配置) ---  
 async function handleAdminConfig(cid, mid, type, key, val, env) {  
   const render = (txt, kb) => api(env.BOT_TOKEN, mid ? "editMessageText" : "sendMessage", { chat_id: cid, message_id: mid, text: txt, parse_mode: "HTML", reply_markup: kb });  
   const back = { text: "🔙 返回", callback_data: "config:menu" };  
@@ -1158,8 +1146,8 @@ async function handleAdminConfig(cid, mid, type, key, val, env) {
         inline_keyboard: [  
           [{ text: "📝 基础", callback_data: "config:menu:base" }, { text: "🤖 自动回复", callback_data: "config:menu:ar" }],  
           [{ text: "🚫 屏蔽词", callback_data: "config:menu:kw" }, { text: "🛠 过滤", callback_data: "config:menu:fl" }],  
-          [{ text: "👮 协管", callback_data: "config:menu:auth" }, { text: "💾 备份/通知", callback_data: "config:menu:bak" }],  
-          [{ text: "🌙 营业状态", callback_data: "config:menu:busy" }]  
+          [{ text: "👮 协管", callback_data: "config:menu:auth" }, { text: "🔔 通知话题", callback_data: "config:menu:bak" }],  
+          [{ text: "🌙 就寝时间", callback_data: "config:menu:sleep" }]  
         ]  
       });  
       if (key === "base") {  
@@ -1177,21 +1165,24 @@ async function handleAdminConfig(cid, mid, type, key, val, env) {
       if (key === "fl") return render("🛠 <b>过滤设置</b>", await getFilterKB(env));  
       if (["ar", "kw", "auth"].includes(key)) return render(`列表: ${key}`, await getListKB(key, env));  
       if (key === "bak") {  
-        const bid = await getCfg("backup_group_id", env), uid = await getCfg("unread_topic_id", env), blk = await getCfg("blocked_topic_id", env);  
-        return render(`💾 <b>备份与通知</b>\n备份群: ${bid || "无"}\n未读话题: ${uid ? `✅ (${uid})` : "⏳"}\n黑名单话题: ${blk ? `✅ (${blk})` : "⏳"}`, {  
+        const uid = await getCfg("unread_topic_id", env), blk = await getCfg("blocked_topic_id", env);  
+        return render(`🔔 <b>聚合与黑名单话题</b>\n未读话题: ${uid ? `✅ (${uid})` : "⏳"}\n黑名单话题: ${blk ? `✅ (${blk})` : "⏳"}`, {  
           inline_keyboard: [  
-            [{ text: "设备份群", callback_data: "config:edit:backup_group_id" }, { text: "清备份", callback_data: "config:cl:backup_group_id" }],  
             [{ text: "重置聚合话题", callback_data: "config:cl:unread_topic_id" }, { text: "重置黑名单", callback_data: "config:cl:blocked_topic_id" }],  
             [back]  
           ]  
         });  
       }  
-      if (key === "busy") {  
-        const on = await getBool("busy_mode", env), msgText = await getCfg("busy_msg", env);  
-        return render(`🌙 <b>营业状态</b>\n当前: ${on ? "🔴 休息中" : "🟢 营业中"}\n回复语: ${escapeHTML(msgText)}`, {  
+      if (key === "sleep") {  
+        const on = await getBool("enable_sleep_mode", env);
+        const start = await getCfg("sleep_start", env);
+        const end = await getCfg("sleep_end", env);
+        const msgText = await getCfg("sleep_msg", env);  
+        return render(`🌙 <b>就寝时间设置</b>\n状态: ${on ? "✅ 自动启用" : "❌ 已关闭"}\n区间: <code>${start}</code> - <code>${end}</code>\n提示语: ${escapeHTML(msgText)}`, {  
           inline_keyboard: [  
-            [{ text: `切换为 ${on ? "🟢 营业" : "🔴 休息"}`, callback_data: `config:toggle:busy_mode:${!on}` }],  
-            [{ text: "✏️ 修改回复语", callback_data: "config:edit:busy_msg" }],  
+            [{ text: `模式: ${on ? "✅ 开启中" : "❌ 已关闭"}`, callback_data: `config:toggle:enable_sleep_mode:${!on}` }],  
+            [{ text: "开始时间", callback_data: "config:edit:sleep_start" }, { text: "结束时间", callback_data: "config:edit:sleep_end" }],
+            [{ text: "✏️ 修改提示语", callback_data: "config:edit:sleep_msg" }],  
             [back]  
           ]  
         });  
@@ -1199,7 +1190,7 @@ async function handleAdminConfig(cid, mid, type, key, val, env) {
     }  
     if (type === "toggle") {  
       await setCfg(key, val, env);  
-      return key === "busy_mode" ? handleAdminConfig(cid, mid, "menu", "busy", null, env) : key === "enable_qa_verify" ? handleAdminConfig(cid, mid, "menu", "base", null, env) : render("🛠 <b>过滤设置</b>", await getFilterKB(env));  
+      return key === "enable_sleep_mode" ? handleAdminConfig(cid, mid, "menu", "sleep", null, env) : key === "enable_qa_verify" ? handleAdminConfig(cid, mid, "menu", "base", null, env) : render("🛠 <b>过滤设置</b>", await getFilterKB(env));  
     }  
     if (type === "cl") {  
       await setCfg(key, key === "authorized_admins" ? "[]" : "", env);  
@@ -1215,6 +1206,7 @@ async function handleAdminConfig(cid, mid, type, key, val, env) {
     if (type === "edit" || type === "add") {  
       await setCfg(`admin_state:${cid}`, JSON.stringify({ action: "input", key: key + (type === "add" ? "_add" : "") }), env);  
       let promptText = `请输入 ${key} 的值 (/cancel 取消):`;  
+      if (key === "sleep_start" || key === "sleep_end") promptText = `请输入时间 (24小时制, 如 23:30) (/cancel 取消):`;
       if (key === "ar" && type === "add") promptText = `请输入自动回复规则,格式:\n<b>关键词===回复内容</b>\n\n例如:价格===请联系人工客服\n(/cancel 取消)`;  
       if (key === "welcome_msg") promptText = `请发送新的欢迎语 (/cancel 取消):\n\n• 支持 <b>文字</b> 或 <b>图片/视频/GIF</b>\n• 支持占位符: {name}\n• 直接发送媒体即可`;  
       return api(env.BOT_TOKEN, "editMessageText", { chat_id: cid, message_id: mid, text: promptText, parse_mode: "HTML" });  
@@ -1290,9 +1282,6 @@ async function handleAdminInput(id, msg, state, env) {
   }  
 }  
   
-// --- 22. 新增辅助函数 (同步/撤回/编辑) ---  
-  
-// 撤回同步  
 async function handleDeleteSync(msg, env) {  
   const replyTo = msg.reply_to_message;  
   const chatId = msg.chat.id.toString();  
@@ -1307,11 +1296,8 @@ async function handleDeleteSync(msg, env) {
   
   if (mapping) {  
     try {  
-      // 1. 删除用户端  
       await api(env.BOT_TOKEN, "deleteMessage", { chat_id: mapping.user_id, message_id: mapping.user_msg_id }).catch(() => {});  
-      // 2. 删除管理端  
       await api(env.BOT_TOKEN, "deleteMessage", { chat_id: env.ADMIN_GROUP_ID, message_id: mapping.admin_msg_id }).catch(() => {});  
-      // 3. 删除指令本身  
       await api(env.BOT_TOKEN, "deleteMessage", { chat_id: chatId, message_id: msg.message_id }).catch(() => {});  
     } catch (e) {  
       console.error("Delete Error:", e);  
@@ -1319,7 +1305,6 @@ async function handleDeleteSync(msg, env) {
   }  
 }  
   
-// 编辑同步  
 async function handleEditSync(msg, env) {  
   const mid = msg.message_id.toString();  
   const cid = msg.chat.id.toString();  
