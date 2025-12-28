@@ -142,7 +142,7 @@ https://api.telegram.org/bot<你的BOT_TOKEN>/setWebhook?url=<你的WORKER_URL>/
 ---
 
 > **💡 提示**：部署完成后，向机器人发送 `/start` 即可体验完整功能！  
-> 遇到问题？请在 [Issues](https://github.com/huliyoudiangou/TG_Chat_Bot-D1/issues) 提交详细日志，我们将快速响应！  
+> 遇到问题？自行解决，因为我也不会。  
 
 **🌟 给项目一个 Star 吧！您的支持是我们持续更新的动力！**  
 [![GitHub stars](https://img.shields.io/github/stars/your-repo/telegram-cf-worker?style=social)](https://github.com/Rude56/TG_Chat_Bot-D1)
