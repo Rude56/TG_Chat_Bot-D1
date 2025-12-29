@@ -392,7 +392,12 @@ function maybeCleanupMessages(env, ctx) {
 
 // --- 6. 主 update 分发 ---  
 async function handleUpdate(update, env, ctx) {
+  if (update.message_reaction) {
+    ctx.waitUntil(handleReactionSync(update.message_reaction, env));
+    return new Response("OK");
+  }
   const msg = update.message || update.edited_message;
+
   if (!msg) return update.callback_query ? handleCallback(update.callback_query, env) : null;
 
   if (update.message && msg.text && msg.text.startsWith("/del") && msg.reply_to_message) {
@@ -1374,4 +1379,40 @@ async function handleEditSync(msg, env) {
       [msg.text ? "text" : "caption"]: content + (isAdmin ? "" : "\n\n(📝 用户已修改内容)")
     });
   } catch { }
+}
+// --- 新增：修正后的表情回应双向同步函数 ---
+async function handleReactionSync(update, env) {
+  try {
+    const chatId = update.chat.id.toString();
+    const messageId = update.message_id.toString();
+    const newReactions = update.new_reaction; // 获取最新的表情列表
+
+    // 判断来源：是管理员在管理群话题里点的，还是用户在私聊里点的
+    const isAdminGroup = chatId === env.ADMIN_GROUP_ID;
+    
+    let mapping;
+    if (isAdminGroup) {
+      // 管理员在群里表态：通过 admin_msg_id 查映射表
+      mapping = await sql(env, "SELECT * FROM msg_mapping WHERE admin_msg_id = ?", [messageId], "first");
+    } else {
+      // 用户在私聊表态：通过 user_id 和 user_msg_id 查映射表
+      mapping = await sql(env, "SELECT * FROM msg_mapping WHERE user_id = ? AND user_msg_id = ?", [chatId, messageId], "first");
+    }
+
+    // 如果数据库里没找到这条消息的对应关系，说明不是转发的消息，直接结束
+    if (!mapping) return;
+
+    const targetChat = isAdminGroup ? mapping.user_id : env.ADMIN_GROUP_ID;
+    const targetMsg = isAdminGroup ? mapping.user_msg_id : mapping.admin_msg_id;
+
+    // 同步表情到另一端
+    await api(env.BOT_TOKEN, "setMessageReaction", {
+      chat_id: targetChat,
+      message_id: targetMsg,
+      reaction: newReactions,
+      is_big: false
+    });
+  } catch (e) {
+    // 忽略无法表态的错误
+  }
 }
