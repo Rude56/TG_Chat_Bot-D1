@@ -46,7 +46,8 @@ const DEFAULTS = {
   enable_audio_forwarding: "true",
   enable_sticker_forwarding: "true",
 
-  // 话题与列表
+  // 话题与列表 (已移除 backup_group_id)
+  unread_topic_id: "",
   blocked_topic_id: "",
   // 就寝时间功能
   enable_sleep_mode: "false",
@@ -58,6 +59,7 @@ const DEFAULTS = {
   authorized_admins: "[]"
 };
 
+const DELIVERED_REACTION = "👍";
 
 // 幂等/限流/锁参数  
 const PROCESSED_UPDATES_TTL_MS = 7 * 24 * 60 * 60 * 1000;
@@ -639,126 +641,109 @@ async function handleVerifiedMsg(msg, u, env, ctx) {
 }
 
 // --- 11. 转发到话题 (已移除备份调用) ---  
-async function relayToTopic(msg, u, env, ctx) {
+// 优化后的转发逻辑
+async function relayToTopic(msg, u, env, ctx, retryCount = 0) {
   const uid = u.user_id;
   if (u.is_blocked && !(await isAuthAdmin(uid, env))) return;
-  const uMeta = getUMeta(msg.from, u, msg.date);
+  
+  // 1. 限制递归深度，防止无限重试
+  if (retryCount > 2) {
+    return api(env.BOT_TOKEN, "sendMessage", { chat_id: uid, text: "⚠️ 系统转发异常，请稍后再试" });
+  }
+
   let tid = u.topic_id;
 
+  // --- 话题创建/获取逻辑 (保持现有的锁机制并优化) ---
   if (!tid) {
     const now = Date.now();
     const staleBefore = now - TOPIC_LOCK_STALE_MS;
-    const lockRes = await tryRun(env, `UPDATE users SET topic_creating=1, topic_create_ts=? WHERE user_id=? AND (topic_id IS NULL OR topic_id='') AND (topic_creating=0 OR topic_create_ts < ?)`, [now, uid, staleBefore]);
+    const lockRes = await tryRun(env, 
+      `UPDATE users SET topic_creating=1, topic_create_ts=? WHERE user_id=? AND (topic_id IS NULL OR topic_id='') AND (topic_creating=0 OR topic_create_ts < ?)`, 
+      [now, uid, staleBefore]
+    );
     const locked = (lockRes?.meta?.changes ?? lockRes?.changes ?? 0) === 1;
 
     if (locked) {
       try {
-        const fresh = await getUser(uid, env);
-        if (fresh.topic_id) { tid = fresh.topic_id; }
-        else {
-          const t = await api(env.BOT_TOKEN, "createForumTopic", { chat_id: env.ADMIN_GROUP_ID, name: uMeta.topicName });
-          tid = t.message_thread_id.toString();
-          await updUser(uid, { topic_id: tid, topic_creating: 0, topic_create_ts: 0 }, env);
-          u.topic_id = tid;
-          await sendInfoCardToTopic(env, u, msg.from, tid);
-        }
+        const uMeta = getUMeta(msg.from, u, msg.date);
+        const t = await api(env.BOT_TOKEN, "createForumTopic", { chat_id: env.ADMIN_GROUP_ID, name: uMeta.topicName });
+        tid = t.message_thread_id.toString();
+        await updUser(uid, { topic_id: tid, topic_creating: 0, topic_create_ts: 0 }, env);
+        u.topic_id = tid;
+        await sendInfoCardToTopic(env, u, msg.from, tid);
       } catch (e) {
-        console.error("Topic Create Error:", e);
         await updUser(uid, { topic_creating: 0 }, env);
-        const existUser = await getUser(uid, env);
-        if (existUser.topic_id) tid = existUser.topic_id;
-        else return api(env.BOT_TOKEN, "sendMessage", { chat_id: uid, text: "⚠️ 系统繁忙,请稍后重试" });
+        console.error("Topic Create Error:", e);
+        return api(env.BOT_TOKEN, "sendMessage", { chat_id: uid, text: "⚠️ 话题创建失败，请联系管理员" });
       }
     } else {
+      // 轮询等待锁释放
       for (let i = 0; i < TOPIC_LOCK_POLL_MAX; i++) {
-        await sleep(Math.min(1500, TOPIC_LOCK_POLL_BASE_MS * Math.pow(2, i)) + Math.floor(Math.random() * 60));
+        await sleep(Math.min(1500, TOPIC_LOCK_POLL_BASE_MS * Math.pow(2, i)));
         const fresh = await getUser(uid, env);
-        if (fresh.topic_id) { tid = fresh.topic_id; u.topic_id = tid; break; }
+        if (fresh.topic_id) { tid = fresh.topic_id; break; }
       }
-      if (!tid) return api(env.BOT_TOKEN, "sendMessage", { chat_id: uid, text: "⚠️ 系统繁忙,请稍后重试" });
+      if (!tid) return api(env.BOT_TOKEN, "sendMessage", { chat_id: uid, text: "⚠️ 系统繁忙，请重试" });
     }
   }
 
-  if (!tid) return;
-
-  let relaySuccess = false;
-  let sentMsgId = null;
+  // --- 消息转发逻辑 ---
   let replyToIdInAdmin = null;
   if (msg.reply_to_message) {
-    try {
-      const ref = await sql(env, "SELECT admin_msg_id FROM msg_mapping WHERE user_id = ? AND user_msg_id = ?",
-        [uid, msg.reply_to_message.message_id.toString()], "first");
-      if (ref) replyToIdInAdmin = ref.admin_msg_id;
-    } catch { }
+    const ref = await sql(env, "SELECT admin_msg_id FROM msg_mapping WHERE user_id = ? AND user_msg_id = ?",
+      [uid, msg.reply_to_message.message_id.toString()], "first");
+    if (ref) replyToIdInAdmin = ref.admin_msg_id;
   }
 
   try {
-    const extra = {};
-    if (msg.text) extra.text = msg.text;
-    if (msg.caption) extra.caption = msg.caption;
-
     const res = await api(env.BOT_TOKEN, "copyMessage", {
       chat_id: env.ADMIN_GROUP_ID,
       from_chat_id: uid,
       message_id: msg.message_id,
       message_thread_id: tid,
       reply_to_message_id: replyToIdInAdmin,
-      ...extra
+      caption: msg.caption, // 明确透传 caption
+      parse_mode: "HTML"
     });
 
     if (res && res.message_id) {
-      sentMsgId = res.message_id;
-      relaySuccess = true;
-      await sql(env, "INSERT OR REPLACE INTO msg_mapping (user_id, user_msg_id, admin_msg_id, ts) VALUES (?, ?, ?, ?)",
-        [uid, msg.message_id.toString(), sentMsgId.toString(), Date.now()]);
+      const sentMsgId = res.message_id.toString();
+      const nowTs = Date.now();
+
+      // 使用 ctx.waitUntil 封装非核心写操作，提高响应速度 [1]
+      ctx.waitUntil((async () => {
+        // 2. 数据库批量写入：映射关系 + 消息历史记录
+        const batchStmts = [
+          env.TG_BOT_DB.prepare("INSERT OR REPLACE INTO msg_mapping (user_id, user_msg_id, admin_msg_id, ts) VALUES (?, ?, ?, ?)").bind(uid, msg.message_id.toString(), sentMsgId, nowTs)
+        ];
+        
+        if (msg.text || msg.caption) {
+          batchStmts.push(
+            env.TG_BOT_DB.prepare("INSERT OR REPLACE INTO messages (user_id, message_id, text, date) VALUES (?, ?, ?, ?)").bind(uid, msg.message_id.toString(), msg.text || msg.caption, msg.date)
+          );
+        }
+        
+        await env.TG_BOT_DB.batch(batchStmts);
+
+        // 3. 异步标记已送达
+        const dk = `delivered:${uid}:${msg.message_id}`;
+        if (!CACHE.locks.has(dk)) {
+          CACHE.locks.add(dk);
+          setTimeout(() => CACHE.locks.delete(dk), 20000);
+          await markDelivered(env, uid, msg.message_id);
+        }
+        
+        maybeCleanupMessages(env, ctx);
+      })());
     }
   } catch (cpErr) {
+    // 4. 话题失效处理 (增加重试计数)
     if (cpErr.message && (cpErr.message.includes("thread") || cpErr.message.includes("not found"))) {
       await updUser(uid, { topic_id: null }, env);
-      return api(env.BOT_TOKEN, "sendMessage", { chat_id: uid, text: "⚠️ 会话已过期,请重发" });
+      u.topic_id = null;
+      return relayToTopic(msg, u, env, ctx, retryCount + 1);
     }
-  }
-
-  if (relaySuccess) {
-    const dk = `delivered:${uid}:${msg.message_id}`;
-    if (!CACHE.locks.has(dk)) {
-      CACHE.locks.add(dk);
-      setTimeout(() => CACHE.locks.delete(dk), 20000);
-      markDelivered(env, uid, msg.message_id, ctx);
-    }
-
-    if (msg.text) {
-      try {
-        await sql(env, "INSERT OR REPLACE INTO messages (user_id, message_id, text, date) VALUES (?,?,?,?)", [uid, msg.message_id, msg.text, msg.date]);
-      } catch { }
-      maybeCleanupMessages(env, ctx);
-    }
-  }
-}
-
-async function markDelivered(env, chatId, messageId, ctx) {
-  try {
-    const sent = await api(env.BOT_TOKEN, "sendMessage", {
-      chat_id: chatId,
-      text: "✅ 消息已送达!",
-      reply_to_message_id: messageId
-    });
-
-    if (sent && sent.message_id) {
-      const deleteDelay = (async () => {
-        await sleep(3000);
-        await api(env.BOT_TOKEN, "deleteMessage", {
-          chat_id: chatId,
-          message_id: sent.message_id
-        }).catch(() => { });
-      })();
-
-      if (ctx && ctx.waitUntil) {
-        ctx.waitUntil(deleteDelay);
-      }
-    }
-  } catch (e) {
-    console.error("送达消息处理失败:", e);
+    return api(env.BOT_TOKEN, "sendMessage", { chat_id: uid, text: "⚠️ 转发失败: " + cpErr.message });
   }
 }
 
