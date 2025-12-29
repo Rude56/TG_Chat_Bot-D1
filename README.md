@@ -115,7 +115,7 @@
 ### 步骤六：设置 Webhook
 在浏览器地址栏输入以下 URL 并回车（替换 `<你的BOT_TOKEN>` 和 `<你的WORKER_URL>` 和 `<你的TELEGRAM_WEBHOOK_SECRET>`）：
 ```bash
-https://api.telegram.org/bot<你的BOT_TOKEN>/setWebhook?url=<你的WORKER_URL>/&secret_token=<你的TELEGRAM_WEBHOOK_SECRET>
+https://api.telegram.org/bot<你的BOT_TOKEN>/setWebhook?url=<你的Worker_URL>&secret_token=<你的TELEGRAM_WEBHOOK_SECRET>&allowed_updates=["message","edited_message","callback_query","message_reaction"]
 ```
 ✅ **成功响应**：
 ```json
