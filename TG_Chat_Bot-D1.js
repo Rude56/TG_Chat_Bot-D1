@@ -715,10 +715,16 @@ async function relayToTopic(msg, u, env, ctx) {
         [uid, msg.message_id.toString(), sentMsgId.toString(), Date.now()]);
     }
   } catch (cpErr) {
+    // 如果报错信息包含 thread 或 not found，说明群组里的话题被删了
     if (cpErr.message && (cpErr.message.includes("thread") || cpErr.message.includes("not found"))) {
+      // 1. 清除掉数据库里那个没用的旧 ID
       await updUser(uid, { topic_id: null }, env);
-      return api(env.BOT_TOKEN, "sendMessage", { chat_id: uid, text: "⚠️ 会话已过期,请重发" });
+      u.topic_id = null; 
+      // 2. 关键：重新调用自己。这时因为 tid 是空，它会自动跑去下面“创建新话题”的流程
+      return relayToTopic(msg, u, env, ctx);
     }
+    // 其他网络错误正常报错
+    return api(env.BOT_TOKEN, "sendMessage", { chat_id: uid, text: "⚠️ 转发失败: " + cpErr.message });
   }
 
   if (relaySuccess) {
