@@ -1382,6 +1382,7 @@ async function handleEditSync(msg, env) {
 }
 // --- 新增：修正后的表情回应双向同步函数 ---
 async function handleReactionSync(update, env) {
+  console.log("收到表态更新事件:", JSON.stringify(update));
   try {
     const chatId = update.chat.id.toString();
     const messageId = update.message_id.toString();
@@ -1413,6 +1414,7 @@ async function handleReactionSync(update, env) {
       is_big: false
     });
   } catch (e) {
-    // 忽略无法表态的错误
+    // 打印具体的错误原因到日志中
+    console.error("表情同步失败:", e.message);
   }
 }
