@@ -74,7 +74,7 @@
 1. 进入 **Workers 和 Pages → 创建 Worker**
 2. 命名 Worker（例如 `tg-contact-bot`）→ 点击 **部署**
 3. 点击 **编辑代码**
-4. **全量覆盖**：删除所有默认代码，将 [`worker.js`](https://github.com/your-repo/telegram-cf-worker/blob/main/worker.js) 的完整代码粘贴进去
+4. **全量覆盖**：删除所有默认代码，将 [`worker.js`](https://github.com/Rude56/TG_Chat_Bot-D1/blob/main/TG_Chat_Bot-D1.js) 的完整代码粘贴进去
 5. **点击部署**，进行下一步配置
 
 ### 步骤三：绑定 D1 数据库
