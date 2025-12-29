@@ -46,8 +46,7 @@ const DEFAULTS = {
   enable_audio_forwarding: "true",
   enable_sticker_forwarding: "true",
 
-  // 话题与列表 (已移除 backup_group_id)
-  unread_topic_id: "",
+  // 话题与列表
   blocked_topic_id: "",
   // 就寝时间功能
   enable_sleep_mode: "false",
@@ -59,7 +58,6 @@ const DEFAULTS = {
   authorized_admins: "[]"
 };
 
-const DELIVERED_REACTION = "👍";
 
 // 幂等/限流/锁参数  
 const PROCESSED_UPDATES_TTL_MS = 7 * 24 * 60 * 60 * 1000;
@@ -393,11 +391,10 @@ function maybeCleanupMessages(env, ctx) {
 // --- 6. 主 update 分发 ---  
 async function handleUpdate(update, env, ctx) {
   if (update.message_reaction) {
-    ctx.waitUntil(handleReactionSync(update.message_reaction, env));
-    return new Response("OK");
+    return handleReactionSync(update.message_reaction, env);
   }
-  const msg = update.message || update.edited_message;
 
+  const msg = update.message || update.edited_message;
   if (!msg) return update.callback_query ? handleCallback(update.callback_query, env) : null;
 
   if (update.message && msg.text && msg.text.startsWith("/del") && msg.reply_to_message) {
@@ -493,15 +490,6 @@ async function handlePrivate(msg, env, ctx) {
     return handleAdminConfig(id, null, "menu", null, null, env);
   }
 
-  if (text === "/receipt") {
-    const currentSetting = u0.user_info.enable_receipt !== false;
-    const nextSetting = !currentSetting;
-    await updUser(id, { user_info: { enable_receipt: nextSetting } }, env);
-    return api(env.BOT_TOKEN, "sendMessage", {
-      chat_id: id,
-      text: nextSetting ? "✅ 已开启送达报告 (👍)" : "❌ 已关闭送达报告"
-    });
-  }
   if (text === "/help" && (await isAuthAdmin(id, env))) {
     return api(env.BOT_TOKEN, "sendMessage", { chat_id: id, text: "ℹ️ <b>帮助</b>\n• 回复消息即对话\n• /start 打开面板\n• /del 双向撤回\n• /reset <id> 重置验证", parse_mode: "HTML" });
   }
@@ -736,9 +724,7 @@ async function relayToTopic(msg, u, env, ctx) {
     if (!CACHE.locks.has(dk)) {
       CACHE.locks.add(dk);
       setTimeout(() => CACHE.locks.delete(dk), 20000);
-      if (u.user_info.enable_receipt !== false) {
-        markDelivered(env, uid, msg.message_id);
-      }
+      markDelivered(env, uid, msg.message_id, ctx);
     }
 
     if (msg.text) {
@@ -747,16 +733,33 @@ async function relayToTopic(msg, u, env, ctx) {
       } catch { }
       maybeCleanupMessages(env, ctx);
     }
-    await handleInbox(env, msg, u, tid, uMeta);
   }
 }
 
-async function markDelivered(env, chatId, messageId) {
+async function markDelivered(env, chatId, messageId, ctx) {
   try {
-    await api(env.BOT_TOKEN, "setMessageReaction", {
-      chat_id: chatId, message_id: messageId, reaction: [{ type: "emoji", emoji: DELIVERED_REACTION }], is_big: false
+    const sent = await api(env.BOT_TOKEN, "sendMessage", {
+      chat_id: chatId,
+      text: "✅ 消息已送达!",
+      reply_to_message_id: messageId
     });
-  } catch { }
+
+    if (sent && sent.message_id) {
+      const deleteDelay = (async () => {
+        await sleep(3000);
+        await api(env.BOT_TOKEN, "deleteMessage", {
+          chat_id: chatId,
+          message_id: sent.message_id
+        }).catch(() => { });
+      })();
+
+      if (ctx && ctx.waitUntil) {
+        ctx.waitUntil(deleteDelay);
+      }
+    }
+  } catch (e) {
+    console.error("送达消息处理失败:", e);
+  }
 }
 
 // --- 12. 资料卡 ---  
@@ -770,47 +773,6 @@ async function sendInfoCardToTopic(env, u, tgUser, tid, date) {
     api(env.BOT_TOKEN, "pinChatMessage", { chat_id: env.ADMIN_GROUP_ID, message_id: card.message_id, message_thread_id: tid }).catch(() => { });
     return card.message_id;
   } catch { return null; }
-}
-
-// --- 13. 未读通知 ---  
-async function handleInbox(env, msg, u, tid, uMeta) {
-  const lk = `inbox:${u.user_id}`;
-  if (CACHE.locks.has(lk)) return;
-  CACHE.locks.add(lk);
-  setTimeout(() => CACHE.locks.delete(lk), 3000);
-
-  let inboxId = await getCfg("unread_topic_id", env);
-  if (!inboxId) {
-    try {
-      const t = await api(env.BOT_TOKEN, "createForumTopic", { chat_id: env.ADMIN_GROUP_ID, name: "🔔 未读消息" });
-      inboxId = t.message_thread_id.toString();
-      await setCfg("unread_topic_id", inboxId, env);
-    } catch { return; }
-  }
-
-  const gid = env.ADMIN_GROUP_ID.toString().replace(/^-100/, "");
-  const preview = msg.text ? (msg.text.length > 20 ? msg.text.substring(0, 20) + "..." : msg.text) : "[媒体消息]";
-  const cardText = `<b>🔔 新消息</b>\n${uMeta.card}\n📝 <b>预览:</b> ${escapeHTML(preview)}`;
-  const kb = { inline_keyboard: [[{ text: "🚀 直达回复", url: `https://t.me/c/${gid}/${tid}` }, { text: "✅ 已阅", callback_data: `inbox:del:${u.user_id}` }]] };
-
-  try {
-    if (u.user_info.inbox_msg_id) {
-      try {
-        await api(env.BOT_TOKEN, "editMessageText", {
-          chat_id: env.ADMIN_GROUP_ID, message_id: u.user_info.inbox_msg_id, message_thread_id: inboxId,
-          text: cardText, parse_mode: "HTML", reply_markup: kb
-        });
-        await updUser(u.user_id, { user_info: { last_notify: Date.now() } }, env);
-        return;
-      } catch { }
-    }
-    const nm = await api(env.BOT_TOKEN, "sendMessage", {
-      chat_id: env.ADMIN_GROUP_ID, message_thread_id: inboxId, text: cardText, parse_mode: "HTML", reply_markup: kb
-    });
-    await updUser(u.user_id, { user_info: { last_notify: Date.now(), inbox_msg_id: nm.message_id } }, env);
-  } catch (e) {
-    if (e.message && e.message.includes("thread")) await setCfg("unread_topic_id", "", env);
-  }
 }
 
 // --- 14. 黑名单 ---  
@@ -1031,46 +993,30 @@ const getUMeta = (tgUser, dbUser, d) => {
 const getBtns = (id, blk) => ({ inline_keyboard: [[{ text: "👤 主页", url: `tg://user?id=${id}` }], [{ text: blk ? "✅ 解封" : "🚫 屏蔽", callback_data: `${blk ? "unblock" : "block"}:${id}` }], [{ text: "✏️ 备注", callback_data: `note:set:${id}` }, { text: "📌 置顶", callback_data: `pin_card:${id}` }]] });
 
 // --- 18. Commands ---  
-async function registerCommands(env) {  
-  try {  
-    // 1. 设置所有人的默认菜单
-    await api(env.BOT_TOKEN, "deleteMyCommands", { scope: { type: "default" } });  
-    await api(env.BOT_TOKEN, "setMyCommands", { 
+async function registerCommands(env) {
+  try {
+    await api(env.BOT_TOKEN, "deleteMyCommands", { scope: { type: "default" } });
+    await api(env.BOT_TOKEN, "setMyCommands", {
       commands: [
         { command: "start", description: "开始" },
-        { command: "del", description: "撤回(需引用)" },
-        { command: "receipt", description: "开关送达报告(👍)" } 
-      ], 
-      scope: { type: "default" } 
-    });  
-
-    // 2. 获取管理员列表
-    const admins = [...(env.ADMIN_IDS || "").split(/[,,]/), ...(await getJsonCfg("authorized_admins", env))];  
-    const uniqueAdmins = [...new Set(admins.map(i => i.toString().trim()).filter(Boolean))];  
-
-    for (const id of uniqueAdmins) {  
-      // --- 管理员私聊菜单：只保留 /start 和 /reset ---
-      await api(env.BOT_TOKEN, "setMyCommands", {  
+        { command: "del", description: "撤回(需引用)" }
+      ],
+      scope: { type: "default" }
+    });
+    const admins = [...(env.ADMIN_IDS || "").split(/[,,]/), ...(await getJsonCfg("authorized_admins", env))];
+    const uniqueAdmins = [...new Set(admins.map(i => i.toString().trim()).filter(Boolean))];
+    for (const id of uniqueAdmins) {
+      await api(env.BOT_TOKEN, "setMyCommands", {
         commands: [
-          { command: "start", description: "管理面板" }, 
+          { command: "start", description: "面板" },
+          { command: "del", description: "双向撤回" },
+          { command: "help", description: "帮助" },
           { command: "reset", description: "重置用户验证" }
-        ],  
-        scope: { type: "chat", chat_id: id } 
-      });  
-
-      // --- 管理员在管理群中的菜单：只保留 /del ---
-      if (env.ADMIN_GROUP_ID) {
-        await api(env.BOT_TOKEN, "setMyCommands", {  
-          commands: [
-            { command: "del", description: "双向撤回" }
-          ],  
-          scope: { type: "chat", chat_id: env.ADMIN_GROUP_ID, user_id: id } 
-        });
-      }
-    }  
-  } catch (e) {
-    console.error("Register Commands Error:", e);
-  }  
+        ],
+        scope: { type: "chat", chat_id: id }
+      });
+    }
+  } catch { }
 }
 
 // --- 19. 回调处理 ---  
@@ -1195,15 +1141,6 @@ async function handleAdminConfig(cid, mid, type, key, val, env) {
       }
       if (key === "fl") return render("🛠 <b>过滤设置</b>", await getFilterKB(env));
       if (["ar", "kw", "auth"].includes(key)) return render(`列表: ${key}`, await getListKB(key, env));
-      if (key === "bak") {
-        const uid = await getCfg("unread_topic_id", env), blk = await getCfg("blocked_topic_id", env);
-        return render(`🔔 <b>聚合与黑名单话题</b>\n未读话题: ${uid ? `✅ (${uid})` : "⏳"}\n黑名单话题: ${blk ? `✅ (${blk})` : "⏳"}`, {
-          inline_keyboard: [
-            [{ text: "重置聚合话题", callback_data: "config:cl:unread_topic_id" }, { text: "重置黑名单", callback_data: "config:cl:blocked_topic_id" }],
-            [back]
-          ]
-        });
-      }
       if (key === "sleep") {
         const on = await getBool("enable_sleep_mode", env);
         const start = await getCfg("sleep_start", env);
@@ -1380,41 +1317,32 @@ async function handleEditSync(msg, env) {
     });
   } catch { }
 }
-// --- 新增：修正后的表情回应双向同步函数 ---
-async function handleReactionSync(update, env) {
-  console.log("收到表态更新事件:", JSON.stringify(update));
+// --- 22. 表态同步 ---
+async function handleReactionSync(reactionUpdate, env) {
+  const { chat, message_id, new_reaction } = reactionUpdate;
+  const cid = chat.id.toString();
+  const mid = message_id.toString();
+  const isAdmin = cid === env.ADMIN_GROUP_ID;
+
+  // 根据表态发生的聊天位置，从数据库查找映射的消息 ID
+  const mapping = isAdmin
+    ? await sql(env, "SELECT * FROM msg_mapping WHERE admin_msg_id = ?", [mid], "first")
+    : await sql(env, "SELECT * FROM msg_mapping WHERE user_id = ? AND user_msg_id = ?", [cid, mid], "first");
+
+  if (!mapping) return;
+
+  const targetChat = isAdmin ? mapping.user_id : env.ADMIN_GROUP_ID;
+  const targetMsg = isAdmin ? mapping.user_msg_id : mapping.admin_msg_id;
+
   try {
-    const chatId = update.chat.id.toString();
-    const messageId = update.message_id.toString();
-    const newReactions = update.new_reaction; // 获取最新的表情列表
-
-    // 判断来源：是管理员在管理群话题里点的，还是用户在私聊里点的
-    const isAdminGroup = chatId === env.ADMIN_GROUP_ID;
-    
-    let mapping;
-    if (isAdminGroup) {
-      // 管理员在群里表态：通过 admin_msg_id 查映射表
-      mapping = await sql(env, "SELECT * FROM msg_mapping WHERE admin_msg_id = ?", [messageId], "first");
-    } else {
-      // 用户在私聊表态：通过 user_id 和 user_msg_id 查映射表
-      mapping = await sql(env, "SELECT * FROM msg_mapping WHERE user_id = ? AND user_msg_id = ?", [chatId, messageId], "first");
-    }
-
-    // 如果数据库里没找到这条消息的对应关系，说明不是转发的消息，直接结束
-    if (!mapping) return;
-
-    const targetChat = isAdminGroup ? mapping.user_id : env.ADMIN_GROUP_ID;
-    const targetMsg = isAdminGroup ? mapping.user_msg_id : mapping.admin_msg_id;
-
-    // 同步表情到另一端
+    // 调用 API 将新的表情数组同步到对方的消息上
     await api(env.BOT_TOKEN, "setMessageReaction", {
       chat_id: targetChat,
       message_id: targetMsg,
-      reaction: newReactions,
+      reaction: new_reaction, // 透传用户选择的任意表情
       is_big: false
     });
   } catch (e) {
-    // 打印具体的错误原因到日志中
-    console.error("表情同步失败:", e.message);
+    // 忽略表态同步中的非致命错误
   }
 }
