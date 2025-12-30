@@ -747,17 +747,59 @@ async function relayToTopic(msg, u, env, ctx, retryCount = 0) {
   }
 }
 
-// --- 12. 资料卡 ---  
+// --- 12. 优化后的资料卡发送函数 ---
 async function sendInfoCardToTopic(env, u, tgUser, tid, date) {
-  const meta = getUMeta(tgUser, u, date || Date.now() / 1000);
+  if (!u || !u.user_id || !tgUser || !tid) {
+    console.warn("sendInfoCardToTopic: 缺少必要参数", { u, tgUser, tid });
+    return null;
+  }
+
+  const timestamp = date || Date.now() / 1000;
+  const meta = getUMeta(tgUser, u, timestamp);
+
+  // 确保 meta.card 存在（getUMeta 应已处理无用户名情况）
+  if (!meta || !meta.card || meta.card.trim() === "") {
+    console.warn(`sendInfoCardToTopic: 用户 ${u.user_id} 无法生成有效资料卡`);
+    return null;
+  }
+
   try {
+    // 发送资料卡消息
     const card = await api(env.BOT_TOKEN, "sendMessage", {
-      chat_id: env.ADMIN_GROUP_ID, message_thread_id: tid, text: meta.card, parse_mode: "HTML", reply_markup: getBtns(u.user_id, u.is_blocked)
+      chat_id: env.ADMIN_GROUP_ID,
+      message_thread_id: tid,
+      text: meta.card,
+      parse_mode: "HTML",
+      reply_markup: getBtns(u.user_id, u.is_blocked),
+      disable_web_page_preview: true, // 可选：避免链接预览干扰布局
     });
-    await updUser(u.user_id, { user_info: { card_msg_id: card.message_id } }, env);
-    api(env.BOT_TOKEN, "pinChatMessage", { chat_id: env.ADMIN_GROUP_ID, message_id: card.message_id, message_thread_id: tid }).catch(() => { });
+
+    if (!card || !card.message_id) {
+      console.error("sendMessage 返回异常", card);
+      return null;
+    }
+
+    // 更新用户数据库中的 card_msg_id
+    await updUser(u.user_id, {
+      user_info: { card_msg_id: card.message_id }
+    }, env);
+
+    // 尝试置顶消息（失败不影响主流程）
+    await api(env.BOT_TOKEN, "pinChatMessage", {
+      chat_id: env.ADMIN_GROUP_ID,
+      message_id: card.message_id,
+      message_thread_id: tid,
+      disable_notification: true // 安静置顶
+    }).catch(err => {
+      console.warn(`置顶资料卡失败 (user: \( {u.user_id}, msg: \){card.message_id})`, err.message || err);
+    });
+
     return card.message_id;
-  } catch { return null; }
+
+  } catch (error) {
+    console.error(`sendInfoCardToTopic 异常 (user: ${u.user_id})`, error);
+    return null;
+  }
 }
 
 // --- 14. 黑名单 ---  
