@@ -686,23 +686,33 @@ async function relayToTopic(msg, u, env, ctx) {
   if (!tid) return;
 
   // 2. 准备转发参数
-  let replyToIdInAdmin = null;
-  if (msg.reply_to_message) {
-      try {
-          // 尝试寻找该消息在群组里对应的 ID
-          const ref = await sql(env, "SELECT admin_msg_id FROM msg_mapping WHERE user_id = ? AND user_msg_id = ?",
-              [uid, msg.reply_to_message.message_id.toString()], "first");
-          if (ref) replyToIdInAdmin = ref.admin_msg_id;
-      } catch { }
-  }
+let replyParameters = null;
+if (msg.reply_to_message) {
+    try {
+        const ref = await sql(env, "SELECT admin_msg_id FROM msg_mapping WHERE user_id = ? AND user_msg_id = ?",
+            [uid, msg.reply_to_message.message_id.toString()], "first");
+        
+            if (ref) {
+              // 使用展开运算符 (...) 一次性构建对象，避免"属性不存在"的错误
+              replyParameters = {
+                  message_id: ref.admin_msg_id,
+                  ...(msg.quote && {
+                      quote: msg.quote.text,
+                      quote_entities: msg.quote.entities,
+                      quote_position: msg.quote.position
+                  })
+              };
+          }
+    } catch { }
+}
 
-  const extra = {
-      chat_id: env.ADMIN_GROUP_ID,
-      from_chat_id: uid,
-      message_id: msg.message_id,
-      message_thread_id: tid,
-      reply_to_message_id: replyToIdInAdmin
-  };
+const extra = {
+    chat_id: env.ADMIN_GROUP_ID,
+    from_chat_id: uid,
+    message_id: msg.message_id,
+    message_thread_id: tid,
+    reply_parameters: replyParameters // 替换原来的 reply_to_message_id
+};
   if (msg.text) extra.text = msg.text;
   if (msg.caption) extra.caption = msg.caption;
 
@@ -1047,8 +1057,12 @@ async function handleCallback(cb, env) {
           console.error("Del Topic Error:", e); // 忽略话题不存在的错误
       }
 
-      // 清空数据库中的 topic_id
-      await updUser(uid, { topic_id: null }, env);
+      // 清空 topic_id 并重置用户状态为 new (未验证)，同时清除验证随机数
+await updUser(uid, { 
+  topic_id: null, 
+  user_state: "new", 
+  user_info: { verify_nonce: "", verify_nonce_ts: 0 } 
+}, env);
       
       // 提示成功并删除资料卡消息(可选，这里选择更新资料卡状态)
       api(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: cb.id, text: "✅ 话题已删除" }).catch(() => {});
@@ -1130,8 +1144,12 @@ async function handleAdminReply(msg, env) {
               message_thread_id: parseInt(tid, 10)
           }).catch(e => console.log("Topic delete skipped:", e.message));
 
-          // 3. 关键: 立即重置数据库状态 (踢回 new, 清空 topic_id)
-          await updUser(uid, { user_state: "new", topic_id: null }, env);
+          // 3. 关键: 立即重置数据库状态 (踢回 new, 清空 topic_id, 清除验证缓存)
+await updUser(uid, { 
+  user_state: "new", 
+  topic_id: null,
+  user_info: { verify_nonce: "", verify_nonce_ts: 0 }
+}, env);
 
           // 4. 通知用户
           await api(env.BOT_TOKEN, "sendMessage", {
@@ -1165,22 +1183,32 @@ async function handleAdminReply(msg, env) {
   const uid = (await sql(env, "SELECT user_id FROM users WHERE topic_id = ?", msg.message_thread_id.toString(), "first"))?.user_id;
   if (!uid) return;
 
-  let replyToIdInUser = null;
-  if (msg.reply_to_message) {
-      try {
-          const ref = await sql(env, "SELECT user_msg_id FROM msg_mapping WHERE admin_msg_id = ?",
-              [msg.reply_to_message.message_id.toString()], "first");
-          if (ref) replyToIdInUser = ref.user_msg_id;
-      } catch { }
-  }
+  let replyParameters = null;
+if (msg.reply_to_message) {
+    try {
+        const ref = await sql(env, "SELECT user_msg_id FROM msg_mapping WHERE admin_msg_id = ?",
+            [msg.reply_to_message.message_id.toString()], "first");
+        
+            if (ref) {
+              replyParameters = {
+                  message_id: ref.user_msg_id,
+                  ...(msg.quote && {
+                      quote: msg.quote.text,
+                      quote_entities: msg.quote.entities,
+                      quote_position: msg.quote.position
+                  })
+              };
+          }
+    } catch { }
+}
 
-  try {
-      const sent = await api(env.BOT_TOKEN, "copyMessage", {
-          chat_id: uid,
-          from_chat_id: msg.chat.id,
-          message_id: msg.message_id,
-          reply_to_message_id: replyToIdInUser
-      });
+try {
+    const sent = await api(env.BOT_TOKEN, "copyMessage", {
+        chat_id: uid,
+        from_chat_id: msg.chat.id,
+        message_id: msg.message_id,
+        reply_parameters: replyParameters // 替换 reply_to_message_id
+    });
 
       if (sent && sent.message_id) {
           await sql(env, "INSERT OR REPLACE INTO msg_mapping (user_id, user_msg_id, admin_msg_id, ts) VALUES (?, ?, ?, ?)",
@@ -1422,5 +1450,22 @@ async function handleReactionSync(reactionUpdate, env) {
     });
   } catch (e) {
     // 忽略表态同步中的非致命错误
+  }
+}
+// 添加缺失的 markDelivered 函数
+async function markDelivered(env, userId, msgId, ctx) {
+  // 构造请求 promise
+  const p = api(env.BOT_TOKEN, "setMessageReaction", {
+    chat_id: userId,
+    message_id: msgId,
+    reaction: [{ type: "emoji", emoji: DELIVERED_REACTION }]
+  }).catch(e => console.warn("Reaction failed:", e));
+
+  // 确保在 Worker 结束前请求能发出去
+  if (ctx && typeof ctx.waitUntil === "function") {
+    ctx.waitUntil(p);
+  } else {
+    // 如果没有 ctx，稍微等待一下（虽然调用处没有 await，但这能作为兜底）
+    await p;
   }
 }
