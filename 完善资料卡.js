@@ -1086,10 +1086,12 @@ const getUMeta = (tgUser, dbUser, d) => {
 };
 const getBtns = (id, blk) => ({
   inline_keyboard: [
-      [{ text: "👤 主页", url: `tg://user?id=${id}` }],
-      [{ text: blk ? "✅ 解封" : "🚫 屏蔽", callback_data: `${blk ? "unblock" : "block"}:${id}` }],
-      [{ text: "✏️ 备注", callback_data: `note:set:${id}` }, { text: "📌 置顶", callback_data: `pin_card:${id}` }],
-      [{ text: "🗑 删除话题", callback_data: `del_topic_confirm:${id}` }] 
+    [{ text: "👤 主页", url: `tg://user?id=${id}` }],
+    [
+      { text: "✏️ 备注", callback_data: `note:set:${id}` }, 
+      { text: blk ? "✅ 解封" : "🚫 屏蔽", callback_data: `${blk ? "unblock" : "block"}:${id}` }
+    ],
+    [{ text: "🗑 删除话题", callback_data: `del_topic_confirm:${id}` }]
   ]
 });
 
@@ -1210,12 +1212,6 @@ if (act === "del_topic_exec") {
       }
       await manageBlacklist(env, u, { id: uid, first_name: u.user_info.name || "User", username: u.user_info.username }, isB);
       api(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: cb.id, text: isB ? "已屏蔽" : "已解封" }).catch(() => { });
-  }
-
-  if (act === "pin_card") {
-      if (!(await isAuthAdmin(from.id, env))) return api(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: cb.id, text: "无权", show_alert: true }).catch(() => { });
-      api(env.BOT_TOKEN, "pinChatMessage", { chat_id: msg.chat.id, message_id: msg.message_id, message_thread_id: msg.message_thread_id }).catch(() => { });
-      api(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: cb.id, text: "已置顶" }).catch(() => { });
   }
 }
 
