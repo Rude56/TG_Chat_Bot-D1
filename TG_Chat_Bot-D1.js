@@ -30,7 +30,7 @@ const DEFAULTS = {
   enable_verify: "true",
   enable_qa_verify: "true",
   captcha_mode: "turnstile",
-  verif_q: "1+1=?\n提示:||答案在简介中||。",
+  verif_q: "1+1=?\n提示:答案在简介中。",
   verif_a: "2",
 
   // 风控  
@@ -653,16 +653,26 @@ async function relayToTopic(msg, u, env, ctx, emoji) {
       const locked = (lockRes?.meta?.changes ?? lockRes?.changes ?? 0) === 1;
 
       if (locked) {
-          try {
-              const fresh = await getUser(uid, env);
-              if (fresh.topic_id) { tid = fresh.topic_id; }
-              else {
-                  const t = await api(env.BOT_TOKEN, "createForumTopic", { chat_id: env.ADMIN_GROUP_ID, name: uMeta.topicName });
-                  tid = t.message_thread_id.toString();
-                  await updUser(uid, { topic_id: tid, topic_creating: 0, topic_create_ts: 0 }, env);
-                  u.topic_id = tid;
-                  await sendInfoCardToTopic(env, u, msg.from, tid);
-              }
+        try {
+          const fresh = await getUser(uid, env);
+          if (fresh.topic_id) { tid = fresh.topic_id; }
+          else {
+            // 定义颜色列表
+            const colors = [7322096, 16766590, 13338331, 9367192, 16749490, 16478047];
+            // 随机选择一个颜色
+            const randomColor = colors[Math.floor(Math.random() * colors.length)];
+            
+            const t = await api(env.BOT_TOKEN, "createForumTopic", { 
+              chat_id: env.ADMIN_GROUP_ID, 
+              name: uMeta.topicName,
+              icon_color: randomColor // 设置随机颜色
+            });
+            
+            tid = t.message_thread_id.toString();
+            await updUser(uid, { topic_id: tid, topic_creating: 0, topic_create_ts: 0 }, env);
+            u.topic_id = tid;
+            await sendInfoCardToTopic(env, u, msg.from, tid);
+          }
           } catch (e) {
               console.error("Topic Create Error:", e);
               await updUser(uid, { topic_creating: 0 }, env);
@@ -755,14 +765,105 @@ async function relayToTopic(msg, u, env, ctx, emoji) {
 // --- 12. 资料卡 ---  
 async function sendInfoCardToTopic(env, u, tgUser, tid, date) {
   const meta = getUMeta(tgUser, u, date || Date.now() / 1000);
+  const mk = getBtns(u.user_id, u.is_blocked);  
+
   try {
-    const card = await api(env.BOT_TOKEN, "sendMessage", {
-      chat_id: env.ADMIN_GROUP_ID, message_thread_id: tid, text: meta.card, parse_mode: "HTML", reply_markup: getBtns(u.user_id, u.is_blocked)
-    });
+    // 1. 获取用户头像列表
+    const photos = await api(env.BOT_TOKEN, "getUserProfilePhotos", { user_id: tgUser.id, limit: 1 });
+    const hasPhoto = photos && photos.total_count > 0;
+
+    let card;
+    if (hasPhoto) {
+      // 2. 如果有头像，使用 sendPhoto 发送
+      // 获取最大尺寸图片的 file_id
+      const fileId = photos.photos[0][photos.photos[0].length - 1].file_id;
+      card = await api(env.BOT_TOKEN, "sendPhoto", {
+        chat_id: env.ADMIN_GROUP_ID,
+        message_thread_id: tid,
+        photo: fileId,
+        caption: meta.card, // 资料卡文本作为说明文字
+        parse_mode: "HTML",
+        reply_markup: mk
+      });
+    } else {
+      // 3. 无头像或受隐私限制，按原逻辑发送纯文本 [1]
+      card = await api(env.BOT_TOKEN, "sendMessage", {
+        chat_id: env.ADMIN_GROUP_ID,
+        message_thread_id: tid,
+        text: meta.card,
+        parse_mode: "HTML",
+        reply_markup: mk
+      });
+    }  
+
+    // 发送成功后记录 ID 并执行自动置顶 [1]
     await updUser(u.user_id, { user_info: { card_msg_id: card.message_id } }, env);
-    api(env.BOT_TOKEN, "pinChatMessage", { chat_id: env.ADMIN_GROUP_ID, message_id: card.message_id, message_thread_id: tid }).catch(() => { });
+    api(env.BOT_TOKEN, "pinChatMessage", {
+      chat_id: env.ADMIN_GROUP_ID,
+      message_id: card.message_id,
+      message_thread_id: tid
+    }).catch(() => { });  
+
     return card.message_id;
-  } catch { return null; }
+
+  } catch (e) {
+      // 2. 针对性修复：如果报错是因为用户隐私设置 (BUTTON_USER_PRIVACY_RESTRICTED)
+      if (e.message && e.message.includes("BUTTON_USER_PRIVACY_RESTRICTED")) {
+          try {
+              // 移除第一行按钮（即 "👤 主页" 按钮），保留其他功能按钮
+              const safeMk = { inline_keyboard: mk.inline_keyboard.slice(1) };
+
+              // 再次尝试发送（这次不带主页链接）
+              const card = await api(env.BOT_TOKEN, "sendMessage", {
+                  chat_id: env.ADMIN_GROUP_ID,
+                  message_thread_id: tid,
+                  text: meta.card, // 依然发送漂亮的 HTML 资料卡
+                  parse_mode: "HTML",
+                  reply_markup: safeMk
+              });
+
+              // 记录并置顶
+              await updUser(u.user_id, { user_info: { card_msg_id: card.message_id } }, env);
+              api(env.BOT_TOKEN, "pinChatMessage", {
+                  chat_id: env.ADMIN_GROUP_ID,
+                  message_id: card.message_id,
+                  message_thread_id: tid
+              }).catch(() => { });
+
+              return card.message_id;
+          } catch (retryErr) {
+              console.error("重试发送也失败:", retryErr);
+          }
+      }
+
+      // 3. 终极保底：如果上面的重试也失败，或者发生了其他错误
+      console.error("发送失败，转为简易模式:", e);
+      try {
+          const simpleName = tgUser.first_name || "User";
+          // === 修改点开始：处理用户名 ===
+          const usernameStr = tgUser.username ? `@${tgUser.username}` : "无";
+          // === 修改点结束 ===
+
+          const simpleCard = await api(env.BOT_TOKEN, "sendMessage", {
+              chat_id: env.ADMIN_GROUP_ID,
+              message_thread_id: tid,
+              // === 修改点：在文本中添加 Username ===
+              text: `⚠️ 无法生成完整资料卡\n👤 用户: ${simpleName}\n🔗 账号: ${usernameStr}\n🆔 ID: ${tgUser.id}\n❌ 错误原因: ${e.message || e}`
+          });
+
+          api(env.BOT_TOKEN, "pinChatMessage", {
+              chat_id: env.ADMIN_GROUP_ID,
+              message_id: simpleCard.message_id,
+              message_thread_id: tid
+          }).catch(() => { });
+
+          return simpleCard.message_id;
+
+      } catch (finalErr) {
+          console.error("保底发送也失败:", finalErr);
+          // 这里可以考虑返回 null 或者抛出，取决于上层调用逻辑
+      }
+  }
 }
 
 // --- 14. 黑名单 ---  
@@ -770,7 +871,11 @@ async function manageBlacklist(env, u, tgUser, isBlocking) {
   let bid = await getCfg("blocked_topic_id", env);
   if (!bid && isBlocking) {
     try {
-      const t = await api(env.BOT_TOKEN, "createForumTopic", { chat_id: env.ADMIN_GROUP_ID, name: "🚫 黑名单" });
+      const t = await api(env.BOT_TOKEN, "createForumTopic", { 
+        chat_id: env.ADMIN_GROUP_ID, 
+        name: "黑名单",
+        icon_custom_emoji_id: "5386395194029515402" 
+      });
       bid = t.message_thread_id.toString();
       await setCfg("blocked_topic_id", bid, env);
     } catch { return; }
@@ -977,15 +1082,33 @@ const getUMeta = (tgUser, dbUser, d) => {
   const id = tgUser.id.toString();
   const name = (((tgUser.first_name || "") + " " + (tgUser.last_name || "")).trim() || tgUser.first_name || "User");
   const timeStr = new Date(d * 1000).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false });
+  
+  // 新增：获取 Username
+  const username = tgUser.username ? `@${tgUser.username}` : (dbUser.user_info?.username ? `@${dbUser.user_info.username}` : "无");
+  
+  // 备注处理
   const note = dbUser.user_info?.note ? `\n📝 <b>备注:</b> ${escapeHTML(dbUser.user_info.note)}` : "";
-  return { userId: id, name, topicName: `${name} | ${id}`.substring(0, 128), card: `<b>🪪 用户资料</b>\n👤: <code>${escapeHTML(name)}</code>\n🆔: <code>${escapeHTML(id)}</code>${note}\n🕒: <code>${escapeHTML(timeStr)}</code>` };
+  
+  // 修改：话题名称逻辑 (默认为姓名，有备注则显示备注)
+  const topicNameRaw = dbUser.user_info?.note ? dbUser.user_info.note : name;
+  
+  return { 
+      userId: id, 
+      name, 
+      // 截取 128 字符限制
+      topicName: topicNameRaw.substring(0, 128), 
+      // 修改：资料卡添加 🔗 账号 (Username)
+      card: `👤: <code>${escapeHTML(name)}</code>\n🔗: ${escapeHTML(username)}\n🆔: <code>${escapeHTML(id)}</code>${note}\n🕒: <code>${escapeHTML(timeStr)}</code>` 
+  };
 };
 const getBtns = (id, blk) => ({
   inline_keyboard: [
-      [{ text: "👤 主页", url: `tg://user?id=${id}` }],
-      [{ text: blk ? "✅ 解封" : "🚫 屏蔽", callback_data: `${blk ? "unblock" : "block"}:${id}` }],
-      [{ text: "✏️ 备注", callback_data: `note:set:${id}` }, { text: "📌 置顶", callback_data: `pin_card:${id}` }],
-      [{ text: "🗑 删除话题", callback_data: `del_topic_confirm:${id}` }] // 新增的删除按钮
+    [{ text: "👤 主页", url: `tg://user?id=${id}` }],
+    [
+      { text: "✏️ 备注", callback_data: `note:set:${id}` }, 
+      { text: blk ? "✅ 解封" : "🚫 屏蔽", callback_data: `${blk ? "unblock" : "block"}:${id}` }
+    ],
+    [{ text: "🗑 删除话题", callback_data: `del_topic_confirm:${id}` }]
   ]
 });
 
@@ -1041,29 +1164,26 @@ async function handleCallback(cb, env) {
 if (act === "del_topic_exec") {
   if (!(await isAuthAdmin(from.id, env))) return;
   const uid = p1;
-  const u = await getUser(uid, env);  
+  const u = await getUser(uid, env);
   try {
-    if (u.topic_id) {
-      await api(env.BOT_TOKEN, "deleteForumTopic", { chat_id: env.ADMIN_GROUP_ID, message_thread_id: u.topic_id });
-    }
+      if (u.topic_id) {
+          await api(env.BOT_TOKEN, "deleteForumTopic", { chat_id: env.ADMIN_GROUP_ID, message_thread_id: u.topic_id });
+      }
   } catch (e) {
-    console.error("Del Topic Error:", e);
-  }  
+      console.error("Del Topic Error:", e);
+  }
 
-  // 核心修改：清空话题 ID 的同时，重置用户状态为未验证（new）
-  await updUser(uid, { 
-    topic_id: null, 
-    user_state: "new", 
-    user_info: { verify_nonce: "", verify_nonce_ts: 0 } 
-  }, env);  
+  // 修改：彻底清空用户数据 (user_info_json 重置为 "{}")，而非仅重置验证状态
+  // 这将删除：备注、保存的Username、Name、入群时间、验证Nonce等
+  await sql(env, "UPDATE users SET topic_id=NULL, user_state='new', user_info_json='{}', is_blocked=0, block_count=0, topic_creating=0 WHERE user_id=?", [uid]);
 
-  api(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: cb.id, text: "✅ 话题已删除，用户验证已重置" }).catch(() => {});
+  api(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: cb.id, text: "✅ 话题及用户数据已彻底清除" }).catch(() => {});
   return api(env.BOT_TOKEN, "editMessageText", {
-    chat_id: msg.chat.id,
-    message_id: msg.message_id,
-    text: msg.text + "\n\n🗑 <b>话题已删除，用户状态已重置为未验证</b>",
-    parse_mode: "HTML",
-    reply_markup: { inline_keyboard: [] }
+      chat_id: msg.chat.id,
+      message_id: msg.message_id,
+      text: msg.text + "\n\n🗑 <b>话题已删除，用户数据(含备注)已清空</b>",
+      parse_mode: "HTML",
+      reply_markup: { inline_keyboard: [] }
   }).catch(() => {});
 }
 
@@ -1110,12 +1230,6 @@ if (act === "del_topic_exec") {
       await manageBlacklist(env, u, { id: uid, first_name: u.user_info.name || "User", username: u.user_info.username }, isB);
       api(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: cb.id, text: isB ? "已屏蔽" : "已解封" }).catch(() => { });
   }
-
-  if (act === "pin_card") {
-      if (!(await isAuthAdmin(from.id, env))) return api(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: cb.id, text: "无权", show_alert: true }).catch(() => { });
-      api(env.BOT_TOKEN, "pinChatMessage", { chat_id: msg.chat.id, message_id: msg.message_id, message_thread_id: msg.message_thread_id }).catch(() => { });
-      api(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: cb.id, text: "已置顶" }).catch(() => { });
-  }
 }
 
 // --- 20. 管理员回复 (已修正引用功能) ---
@@ -1132,6 +1246,19 @@ async function handleAdminReply(msg, env) {
           u.user_info.note = msg.text === "/clear" || msg.text === "清除" ? "" : msg.text;
           await updUser(state.target, { user_info: u.user_info }, env);
           await setCfg(`admin_state:${msg.from.id}`, "", env);
+          if (u.topic_id) {
+            try {
+                // 重新计算名称：有备注则用备注，否则用姓名
+                const newName = u.user_info.note ? u.user_info.note : u.user_info.name;
+                await api(env.BOT_TOKEN, "editForumTopic", {
+                    chat_id: env.ADMIN_GROUP_ID,
+                    message_thread_id: u.topic_id,
+                    name: newName.substring(0, 128)
+                });
+            } catch (e) {
+                console.error("Rename Topic Failed:", e);
+            }
+        }
           if (u.topic_id && u.user_info.card_msg_id) {
               const meta = getUMeta({ id: state.target, first_name: u.user_info.name, username: u.user_info.username }, u, u.user_info.join_date || Date.now() / 1000);
               api(env.BOT_TOKEN, "editMessageText", {
