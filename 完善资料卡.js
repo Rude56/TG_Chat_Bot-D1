@@ -1065,15 +1065,31 @@ const getUMeta = (tgUser, dbUser, d) => {
   const id = tgUser.id.toString();
   const name = (((tgUser.first_name || "") + " " + (tgUser.last_name || "")).trim() || tgUser.first_name || "User");
   const timeStr = new Date(d * 1000).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false });
+  
+  // 新增：获取 Username
+  const username = tgUser.username ? `@${tgUser.username}` : (dbUser.user_info?.username ? `@${dbUser.user_info.username}` : "无");
+  
+  // 备注处理
   const note = dbUser.user_info?.note ? `\n📝 <b>备注:</b> ${escapeHTML(dbUser.user_info.note)}` : "";
-  return { userId: id, name, topicName: `${name} | ${id}`.substring(0, 128), card: `<b>🪪 用户资料</b>\n👤: <code>${escapeHTML(name)}</code>\n🆔: <code>${escapeHTML(id)}</code>${note}\n🕒: <code>${escapeHTML(timeStr)}</code>` };
+  
+  // 修改：话题名称逻辑 (默认为姓名，有备注则显示备注)
+  const topicNameRaw = dbUser.user_info?.note ? dbUser.user_info.note : name;
+  
+  return { 
+      userId: id, 
+      name, 
+      // 截取 128 字符限制
+      topicName: topicNameRaw.substring(0, 128), 
+      // 修改：资料卡添加 🔗 账号 (Username)
+      card: `👤: <code>${escapeHTML(name)}</code>\n🔗: ${escapeHTML(username)}\n🆔: <code>${escapeHTML(id)}</code>${note}\n🕒: <code>${escapeHTML(timeStr)}</code>` 
+  };
 };
 const getBtns = (id, blk) => ({
   inline_keyboard: [
       [{ text: "👤 主页", url: `tg://user?id=${id}` }],
       [{ text: blk ? "✅ 解封" : "🚫 屏蔽", callback_data: `${blk ? "unblock" : "block"}:${id}` }],
       [{ text: "✏️ 备注", callback_data: `note:set:${id}` }, { text: "📌 置顶", callback_data: `pin_card:${id}` }],
-      [{ text: "🗑 删除话题", callback_data: `del_topic_confirm:${id}` }] // 新增的删除按钮
+      [{ text: "🗑 删除话题", callback_data: `del_topic_confirm:${id}` }] 
   ]
 });
 
@@ -1129,29 +1145,26 @@ async function handleCallback(cb, env) {
 if (act === "del_topic_exec") {
   if (!(await isAuthAdmin(from.id, env))) return;
   const uid = p1;
-  const u = await getUser(uid, env);  
+  const u = await getUser(uid, env);
   try {
-    if (u.topic_id) {
-      await api(env.BOT_TOKEN, "deleteForumTopic", { chat_id: env.ADMIN_GROUP_ID, message_thread_id: u.topic_id });
-    }
+      if (u.topic_id) {
+          await api(env.BOT_TOKEN, "deleteForumTopic", { chat_id: env.ADMIN_GROUP_ID, message_thread_id: u.topic_id });
+      }
   } catch (e) {
-    console.error("Del Topic Error:", e);
-  }  
+      console.error("Del Topic Error:", e);
+  }
 
-  // 核心修改：清空话题 ID 的同时，重置用户状态为未验证（new）
-  await updUser(uid, { 
-    topic_id: null, 
-    user_state: "new", 
-    user_info: { verify_nonce: "", verify_nonce_ts: 0 } 
-  }, env);  
+  // 修改：彻底清空用户数据 (user_info_json 重置为 "{}")，而非仅重置验证状态
+  // 这将删除：备注、保存的Username、Name、入群时间、验证Nonce等
+  await sql(env, "UPDATE users SET topic_id=NULL, user_state='new', user_info_json='{}', is_blocked=0, block_count=0, topic_creating=0 WHERE user_id=?", [uid]);
 
-  api(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: cb.id, text: "✅ 话题已删除，用户验证已重置" }).catch(() => {});
+  api(env.BOT_TOKEN, "answerCallbackQuery", { callback_query_id: cb.id, text: "✅ 话题及用户数据已彻底清除" }).catch(() => {});
   return api(env.BOT_TOKEN, "editMessageText", {
-    chat_id: msg.chat.id,
-    message_id: msg.message_id,
-    text: msg.text + "\n\n🗑 <b>话题已删除，用户状态已重置为未验证</b>",
-    parse_mode: "HTML",
-    reply_markup: { inline_keyboard: [] }
+      chat_id: msg.chat.id,
+      message_id: msg.message_id,
+      text: msg.text + "\n\n🗑 <b>话题已删除，用户数据(含备注)已清空</b>",
+      parse_mode: "HTML",
+      reply_markup: { inline_keyboard: [] }
   }).catch(() => {});
 }
 
@@ -1220,6 +1233,19 @@ async function handleAdminReply(msg, env) {
           u.user_info.note = msg.text === "/clear" || msg.text === "清除" ? "" : msg.text;
           await updUser(state.target, { user_info: u.user_info }, env);
           await setCfg(`admin_state:${msg.from.id}`, "", env);
+          if (u.topic_id) {
+            try {
+                // 重新计算名称：有备注则用备注，否则用姓名
+                const newName = u.user_info.note ? u.user_info.note : u.user_info.name;
+                await api(env.BOT_TOKEN, "editForumTopic", {
+                    chat_id: env.ADMIN_GROUP_ID,
+                    message_thread_id: u.topic_id,
+                    name: newName.substring(0, 128)
+                });
+            } catch (e) {
+                console.error("Rename Topic Failed:", e);
+            }
+        }
           if (u.topic_id && u.user_info.card_msg_id) {
               const meta = getUMeta({ id: state.target, first_name: u.user_info.name, username: u.user_info.username }, u, u.user_info.join_date || Date.now() / 1000);
               api(env.BOT_TOKEN, "editMessageText", {
