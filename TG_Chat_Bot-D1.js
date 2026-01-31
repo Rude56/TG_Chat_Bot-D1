@@ -53,7 +53,7 @@ const DEFAULTS = {
   enable_sleep_mode: "false",
   sleep_start: "23:00",
   sleep_end: "07:00",
-  sleep_msg: "💤我睡着了，醒来第一时间看你消息哦",
+  sleep_msg: "💤 我睡着了，醒来第一时间看你消息哦",
   block_keywords: "[]",
   keyword_responses: "[]",
   authorized_admins: "[]"
@@ -702,7 +702,6 @@ async function relayToTopic(msg, u, env, ctx, emoji) {
       } catch { }
   }
 
-  // --- 核心修改：构建 reply_parameters ---
   const reply_parameters = replyToIdInAdmin ? {
       message_id: replyToIdInAdmin,
       ...(msg.quote ? {
@@ -866,7 +865,7 @@ async function sendInfoCardToTopic(env, u, tgUser, tid, date) {
   }
 }
 
-// --- 14. 黑名单 ---  
+// --- 13. 黑名单 ---  
 async function manageBlacklist(env, u, tgUser, isBlocking) {
   let bid = await getCfg("blocked_topic_id", env);
   if (!bid && isBlocking) {
@@ -897,7 +896,7 @@ async function manageBlacklist(env, u, tgUser, isBlocking) {
   }
 }
 
-// --- 15. Web 验证页 ---  
+// --- 14. Web 验证页 ---  
 async function handleVerifyPage(url, env) {
   const uid = url.searchParams.get("user_id");
   const nonce = url.searchParams.get("nonce") || "";
@@ -1010,7 +1009,7 @@ async function verifyAnswer(id, ans, env) {
   }
 }
 
-// --- 16. initData 验签 ---  
+// --- 15. initData 验签 ---  
 async function verifyTelegramInitData(initData, botToken, maxAgeSec) {
   const params = new URLSearchParams(initData);
   const hash = params.get("hash");
@@ -1057,7 +1056,7 @@ function timingSafeEqualStr(a, b) {
   return r === 0;
 }
 
-// --- 17. 辅助函数 ---  
+// --- 16. 辅助函数 ---  
 const getBool = async (k, e) => (await getCfg(k, e)) === "true";
 const getJsonCfg = async (k, e) => safeParse(await getCfg(k, e), []);
 function escapeHTML(t) { return (t || "").toString().replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;"); }
@@ -1112,7 +1111,7 @@ const getBtns = (id, blk) => ({
   ]
 });
 
-// --- 18. Commands ---  
+// --- 17. Commands ---  
 async function registerCommands(env) {
   try {
     await api(env.BOT_TOKEN, "deleteMyCommands", { scope: { type: "default" } });
@@ -1139,7 +1138,7 @@ async function registerCommands(env) {
   } catch { }
 }
 
-// --- 19. 回调处理 ---  
+// --- 18. 回调处理 ---  
 async function handleCallback(cb, env) {
   const { data, message: msg, from } = cb;
   const [act, p1, p2] = (data || "").split(":");
@@ -1198,7 +1197,6 @@ if (act === "del_topic_exec") {
       }).catch(() => {});
   }
 
-  // --- 原有的其他逻辑保持不变 ---
 
   if (act === "inbox" && p1 === "del") {
       await api(env.BOT_TOKEN, "deleteMessage", { chat_id: msg.chat.id, message_id: msg.message_id }).catch(() => { });
@@ -1232,7 +1230,7 @@ if (act === "del_topic_exec") {
   }
 }
 
-// --- 20. 管理员回复 (已修正引用功能) ---
+// --- 19. 管理员回复 ---
 async function handleAdminReply(msg, env) {
   // 基础检查：必须是群组话题中的消息、非机器人、必须是授权管理员
   if (!msg.message_thread_id || msg.from.is_bot || !(await isAuthAdmin(msg.from.id, env))) return;
@@ -1283,7 +1281,6 @@ async function handleAdminReply(msg, env) {
       } catch { }
   }
 
-  // --- 核心修改：构建 reply_parameters ---
   // 使用展开运算符一次性构建对象，避免 IDE 报错
   const reply_parameters = replyToIdInUser ? {
       message_id: replyToIdInUser,
@@ -1313,155 +1310,222 @@ async function handleAdminReply(msg, env) {
   }
 }
 
-// --- 21. 面板 (已移除备份配置，增加就寝时间配置) ---  
-async function handleAdminConfig(cid, mid, type, key, val, env) {
-  const render = (txt, kb) => api(env.BOT_TOKEN, mid ? "editMessageText" : "sendMessage", { chat_id: cid, message_id: mid, text: txt, parse_mode: "HTML", reply_markup: kb });
-  const back = { text: "🔙 返回", callback_data: "config:menu" };
+// --- 20. 控制面板 ---  
+// 统一的键名到前端标签的映射表
+const LABEL_MAP = {
+  "welcome_msg": "👋 欢迎语",
+  "verif_q": "❓ 验证问题",
+  "verif_a": "🔑 答案",
+  "sleep_start": "😴 睡觉时间",
+  "sleep_end": "⏰ 起床时间",
+  "sleep_msg": "💤 提示语",
+  "ar": "🤖 自动回复",
+  "kw": "🚫 屏蔽词",
+  "auth": "👮 管理员",
+  "keyword_responses": "🤖 自动回复",
+  "block_keywords": "🚫 屏蔽词",
+  "authorized_admins": "👮 管理员"
+};
 
-  try {
-    if (!type || type === "menu") {
-      if (!key) return render("⚙️ <b>控制面板</b>", {
+async function handleAdminConfig(cid, mid, type, key, val, env) {
+const render = (txt, kb) => api(env.BOT_TOKEN, mid ? "editMessageText" : "sendMessage", { chat_id: cid, message_id: mid, text: txt, parse_mode: "HTML", reply_markup: kb });
+const back = { text: "🔙 返回", callback_data: "config:menu" };
+
+try {
+  if (!type || type === "menu") {
+    if (!key) return render("⚙️ <b>控制面板</b>", {
+      inline_keyboard: [
+        [{ text: "🛡️ 人机验证", callback_data: "config:menu:base" }, { text: "🤖 自动回复", callback_data: "config:menu:ar" }],
+        [{ text: "🚫 屏蔽词", callback_data: "config:menu:kw" }, { text: "👀 过滤", callback_data: "config:menu:fl" }],
+        [{ text: "👮 协管", callback_data: "config:menu:auth" }, { text: "🌙 就寝", callback_data: "config:menu:sleep" }],
+      ]
+    });
+    if (key === "base") {
+      const mode = await getCfg("captcha_mode", env), captchaOn = await getBool("enable_verify", env), qaOn = await getBool("enable_qa_verify", env);
+      let statusText = "❌ 已关闭"; if (captchaOn) statusText = mode === "recaptcha" ? "Google" : "Cloudflare";
+      return render(`<b>基础配置</b>\n验证码模式: ${statusText}\n问题验证: ${qaOn ? "✅" : "❌"}`, {
         inline_keyboard: [
-          [{ text: "📝 基础", callback_data: "config:menu:base" }, { text: "🤖 自动回复", callback_data: "config:menu:ar" }],
-          [{ text: "🚫 屏蔽词", callback_data: "config:menu:kw" }, { text: "🛠 过滤", callback_data: "config:menu:fl" }],
-          [{ text: "👮 协管", callback_data: "config:menu:auth" }, { text: "🌙 就寝时间", callback_data: "config:menu:sleep" }],
+          [{ text: "👋 欢迎语", callback_data: "config:edit:welcome_msg" }, { text: "❓ 问题", callback_data: "config:edit:verif_q" }, { text: "🔑 答案", callback_data: "config:edit:verif_a" }],
+          [{ text: `🔄️ 模式切换`, callback_data: `config:rotate_mode` }],
+          [{ text: `问题验证: ${qaOn ? "✅ 开启" : "❌ 关闭"}`, callback_data: `config:toggle:enable_qa_verify:${!qaOn}` }],
+          [back]
         ]
       });
-      if (key === "base") {
-        const mode = await getCfg("captcha_mode", env), captchaOn = await getBool("enable_verify", env), qaOn = await getBool("enable_qa_verify", env);
-        let statusText = "❌ 已关闭"; if (captchaOn) statusText = mode === "recaptcha" ? "Google" : "Cloudflare";
-        return render(`基础配置\n验证码模式: ${statusText}\n问题验证: ${qaOn ? "✅" : "❌"}`, {
-          inline_keyboard: [
-            [{ text: "欢迎语", callback_data: "config:edit:welcome_msg" }, { text: "问题", callback_data: "config:edit:verif_q" }, { text: "答案", callback_data: "config:edit:verif_a" }],
-            [{ text: `验证码模式: ${statusText} (点击切换)`, callback_data: `config:rotate_mode` }],
-            [{ text: `问题验证: ${qaOn ? "✅ 开启" : "❌ 关闭"}`, callback_data: `config:toggle:enable_qa_verify:${!qaOn}` }],
-            [back]
-          ]
-        });
-      }
-      if (key === "fl") return render("🛠 <b>过滤设置</b>", await getFilterKB(env));
-      if (["ar", "kw", "auth"].includes(key)) return render(`列表: ${key}`, await getListKB(key, env));
-      if (key === "sleep") {
-        const on = await getBool("enable_sleep_mode", env);
-        const start = await getCfg("sleep_start", env);
-        const end = await getCfg("sleep_end", env);
-        const msgText = await getCfg("sleep_msg", env);
-        return render(`🌙 <b>就寝时间设置</b>\n状态: ${on ? "✅ 自动启用" : "❌ 已关闭"}\n区间: <code>${start}</code> - <code>${end}</code>\n提示语: ${escapeHTML(msgText)}`, {
-          inline_keyboard: [
-            [{ text: `模式: ${on ? "✅ 开启中" : "❌ 已关闭"}`, callback_data: `config:toggle:enable_sleep_mode:${!on}` }],
-            [{ text: "开始时间", callback_data: "config:edit:sleep_start" }, { text: "结束时间", callback_data: "config:edit:sleep_end" }],
-            [{ text: "✏️ 修改提示语", callback_data: "config:edit:sleep_msg" }],
-            [back]
-          ]
-        });
-      }
     }
-    if (type === "toggle") {
-      await setCfg(key, val, env);
-      return key === "enable_sleep_mode" ? handleAdminConfig(cid, mid, "menu", "sleep", null, env) : key === "enable_qa_verify" ? handleAdminConfig(cid, mid, "menu", "base", null, env) : render("🛠 <b>过滤设置</b>", await getFilterKB(env));
+    if (key === "fl") return render("🛠 <b>过滤设置</b>", await getFilterKB(env));
+    if (["ar", "kw", "auth"].includes(key)) {
+      const label = LABEL_MAP[key] || key;
+      return render(`<b>${label}</b>`, await getListKB(key, env));
     }
-    if (type === "cl") {
-      await setCfg(key, key === "authorized_admins" ? "[]" : "", env);
-      return handleAdminConfig(cid, mid, "menu", key === "unread_topic_id" || key === "blocked_topic_id" ? "bak" : key === "authorized_admins" ? "auth" : "bak", null, env);
+    if (key === "sleep") {
+      const on = await getBool("enable_sleep_mode", env);
+      const start = await getCfg("sleep_start", env);
+      const end = await getCfg("sleep_end", env);
+      const msgText = await getCfg("sleep_msg", env);
+      return render(`🌙 <b>就寝时间设置</b>\n状态: ${on ? "✅ 自动启用" : "❌ 已关闭"}\n区间: <code>${start}</code> - <code>${end}</code>\n提示语: ${escapeHTML(msgText)}`, {
+        inline_keyboard: [
+          [{ text: `🔄️ 模式切换`, callback_data: `config:toggle:enable_sleep_mode:${!on}` }],
+          [{ text: "😴 睡觉时间", callback_data: "config:edit:sleep_start" }, { text: "⏰ 起床时间", callback_data: "config:edit:sleep_end" }],
+          [{ text: "💤 提示语", callback_data: "config:edit:sleep_msg" }],
+          [back]
+        ]
+      });
     }
-    if (type === "del") {
-      const realK = key === "kw" ? "block_keywords" : key === "auth" ? "authorized_admins" : "keyword_responses";
-      let l = await getJsonCfg(realK, env);
-      l = (Array.isArray(l) ? l : []).filter(i => (i.id || i).toString() !== val);
-      await setCfg(realK, JSON.stringify(l), env);
-      return render(`列表: ${key}`, await getListKB(key, env));
+  }
+  if (type === "toggle") {
+    await setCfg(key, val, env);
+    return key === "enable_sleep_mode" ? handleAdminConfig(cid, mid, "menu", "sleep", null, env) : key === "enable_qa_verify" ? handleAdminConfig(cid, mid, "menu", "base", null, env) : render("🛠 <b>过滤设置</b>", await getFilterKB(env));
+  }
+  if (type === "cl") {
+    await setCfg(key, key === "authorized_admins" ? "[]" : "", env);
+    return handleAdminConfig(cid, mid, "menu", key === "unread_topic_id" || key === "blocked_topic_id" ? "bak" : key === "authorized_admins" ? "auth" : "bak", null, env);
+  }
+  if (type === "del") {
+    const realK = key === "kw" ? "block_keywords" : key === "auth" ? "authorized_admins" : "keyword_responses";
+    let l = await getJsonCfg(realK, env);
+    l = (Array.isArray(l) ? l : []).filter(i => (i.id || i).toString() !== val);
+    await setCfg(realK, JSON.stringify(l), env);
+    const label = LABEL_MAP[key] || key;
+    return render(`<b>${label}</b> 已更新`, await getListKB(key, env));
+  }
+  if (type === "edit" || type === "add") {
+    await setCfg(`admin_state:${cid}`, JSON.stringify({ action: "input", key: key + (type === "add" ? "_add" : "") }), env);
+    const label = LABEL_MAP[key] || key;
+    let promptText = `请输入新的 <b>${label}</b>\n退出点 /cancel`;
+
+    if (key === "sleep_start" || key === "sleep_end") {
+        promptText = `请输入新的 <b>${label}</b>\n请输入 24 小时制时间 (如 23:30 )\n退出点 /cancel`;
+    } else if (key === "ar" && type === "add") {
+        promptText = `请输入新的 <b>${label}</b>\n格式: <code>关键词===回复内容</code>\n例如: <code>价格===请联系人工</code>\n退出点 /cancel`;
+    } else if (key === "welcome_msg") {
+        promptText = `请输入新的 <b>${label}</b>\n• 支持文字、图片、视频、GIF\n• 占位符: {name}\n• 直接发送媒体或文字即可\n退出点 /cancel`;
     }
-    if (type === "edit" || type === "add") {
-      await setCfg(`admin_state:${cid}`, JSON.stringify({ action: "input", key: key + (type === "add" ? "_add" : "") }), env);
-      let promptText = `请输入 ${key} 的值 (/cancel 取消):`;
-      if (key === "sleep_start" || key === "sleep_end") promptText = `请输入时间 (24小时制, 如 23:30) (/cancel 取消):`;
-      if (key === "ar" && type === "add") promptText = `请输入自动回复规则,格式:\n<b>关键词===回复内容</b>\n\n例如:价格===请联系人工客服\n(/cancel 取消)`;
-      if (key === "welcome_msg") promptText = `请发送新的欢迎语 (/cancel 取消):\n\n• 支持 <b>文字</b> 或 <b>图片/视频/GIF</b>\n• 支持占位符: {name}\n• 直接发送媒体即可`;
-      return api(env.BOT_TOKEN, "editMessageText", { chat_id: cid, message_id: mid, text: promptText, parse_mode: "HTML" });
+
+    return api(env.BOT_TOKEN, "editMessageText", { 
+        chat_id: cid, 
+        message_id: mid, 
+        text: promptText, 
+        parse_mode: "HTML" 
+    });
+  }
+  if (type === "rotate_mode") {
+    const currentMode = await getCfg("captcha_mode", env), isEnabled = await getBool("enable_verify", env);
+    let nextMode = "turnstile", nextEnable = "true", toast = "已切换: Cloudflare";
+    if (isEnabled) {
+      if (currentMode === "turnstile") { nextMode = "recaptcha"; toast = "已切换: Google"; }
+      else { nextEnable = "false"; nextMode = currentMode; toast = "验证已关闭"; }
     }
-    if (type === "rotate_mode") {
-      const currentMode = await getCfg("captcha_mode", env), isEnabled = await getBool("enable_verify", env);
-      let nextMode = "turnstile", nextEnable = "true", toast = "已切换: Cloudflare";
-      if (isEnabled) {
-        if (currentMode === "turnstile") { nextMode = "recaptcha"; toast = "已切换: Google"; }
-        else { nextEnable = "false"; nextMode = currentMode; toast = "验证已关闭"; }
-      }
-      await setCfg("captcha_mode", nextMode, env);
-      await setCfg("enable_verify", nextEnable, env);
-      return render(`基础配置已更新\n${toast}`, { inline_keyboard: [[back]] });
-    }
-  } catch (e) { console.error("handleAdminConfig error:", e); }
+    await setCfg("captcha_mode", nextMode, env);
+    await setCfg("enable_verify", nextEnable, env);
+    return handleAdminConfig(cid, mid, "menu", "base", null, env);
+  }
+} catch (e) { console.error("handleAdminConfig error:", e); }
 }
 
 async function getFilterKB(env) {
-  const s = async k => ((await getBool(k, env)) ? "✅" : "❌");
-  const b = (t, k, v) => ({ text: `${t} ${v}`, callback_data: `config:toggle:${k}:${v === "❌"}` });
-  const keys = ["enable_forward_forwarding", "enable_image_forwarding", "enable_audio_forwarding", "enable_sticker_forwarding", "enable_link_forwarding", "enable_channel_forwarding", "enable_text_forwarding"];
-  const vals = await Promise.all(keys.map(k => s(k)));
-  return { inline_keyboard: [[b("转发", keys[0], vals[0])], [b("媒体", keys[1], vals[1]), b("语音", keys[2], vals[2])], [b("贴纸", keys[3], vals[3]), b("链接", keys[4], vals[4])], [b("频道", keys[5], vals[5]), b("文本", keys[6], vals[6])], [{ text: "🔙 返回", callback_data: "config:menu" }]] };
+const s = async k => ((await getBool(k, env)) ? "✅" : "❌");
+const b = (t, k, v) => ({ text: `${t} ${v}`, callback_data: `config:toggle:${k}:${v === "❌"}` });
+const keys = ["enable_forward_forwarding", "enable_image_forwarding", "enable_audio_forwarding", "enable_sticker_forwarding", "enable_link_forwarding", "enable_channel_forwarding", "enable_text_forwarding"];
+const vals = await Promise.all(keys.map(k => s(k)));
+return { inline_keyboard: [[b("转发", keys[0], vals[0])], [b("媒体", keys[1], vals[1]), b("语音", keys[2], vals[2])], [b("贴纸", keys[3], vals[3]), b("链接", keys[4], vals[4])], [b("频道", keys[5], vals[5]), b("文本", keys[6], vals[6])], [{ text: "🔙 返回", callback_data: "config:menu" }]] };
 }
 
 async function getListKB(type, env) {
-  const k = type === "ar" ? "keyword_responses" : type === "kw" ? "block_keywords" : "authorized_admins";
-  const l = await getJsonCfg(k, env);
-  const btns = (Array.isArray(l) ? l : []).map(i => [{ text: `🗑 ${type === "ar" ? i.keywords : i}`, callback_data: `config:del:${type}:${i.id || i}` }]);
-  btns.push([{ text: "➕ 添加", callback_data: `config:add:${type}` }], [{ text: "🔙 返回", callback_data: "config:menu" }]);
-  return { inline_keyboard: btns };
+const k = type === "ar" ? "keyword_responses" : type === "kw" ? "block_keywords" : "authorized_admins";
+const l = await getJsonCfg(k, env);
+const btns = (Array.isArray(l) ? l : []).map(i => [{ text: `🗑 ${type === "ar" ? i.keywords : i}`, callback_data: `config:del:${type}:${i.id || i}` }]);
+btns.push([{ text: "➕ 添加", callback_data: `config:add:${type}` }], [{ text: "🔙 返回", callback_data: "config:menu" }]);
+return { inline_keyboard: btns };
 }
 
 async function handleAdminInput(id, msg, state, env) {
-  const txt = msg.text || "";
-  if (txt === "/cancel") {
-    await sql(env, "DELETE FROM config WHERE key=?", [`admin_state:${id}`]);
-    return handleAdminConfig(id, null, "menu", null, null, env);
-  }
-  let k = state.key, val = txt;
-  try {
-    if (k === "sleep_start" || k === "sleep_end") {
-      let cleanVal = txt.replace(/：/g, ":").trim();
-      if (/^\d:\d{2}$/.test(cleanVal)) cleanVal = "0" + cleanVal;
-      if (!/^([01]\d|2[0-3]):([0-5]\d)$/.test(cleanVal)) {
-        return api(env.BOT_TOKEN, "sendMessage", {
-          chat_id: id,
-          text: "❌ <b>时间格式错误</b>\n请输入 24 小时制时间，例如 <code>08:00</code> 或 <code>23:30</code>。",
-          parse_mode: "HTML"
-        });
-      }
-      val = cleanVal;
-    }
-    if (k === "welcome_msg") {
-      if (msg.photo || msg.video || msg.animation) {
-        let fileId, type;
-        if (msg.photo) { type = "photo"; fileId = msg.photo[msg.photo.length - 1].file_id; }
-        else if (msg.video) { type = "video"; fileId = msg.video.file_id; }
-        else if (msg.animation) { type = "animation"; fileId = msg.animation.file_id; }
-        val = JSON.stringify({ type: type, file_id: fileId, caption: msg.caption || "" });
-      } else { val = txt; }
-    } else if (k.endsWith("_add")) {
-      k = k.replace("_add", "");
-      const realK = k === "ar" ? "keyword_responses" : k === "kw" ? "block_keywords" : "authorized_admins";
-      const list = await getJsonCfg(realK, env);
-      const arr = Array.isArray(list) ? list : [];
-      if (k === "ar") {
-        const [kk, rr] = txt.split("===");
-        if (kk && rr) arr.push({ keywords: kk, response: rr, id: Date.now() });
-        else return api(env.BOT_TOKEN, "sendMessage", { chat_id: id, text: "❌ 格式错误,请使用:关键词===回复内容" });
-      } else arr.push(txt);
-      val = JSON.stringify(arr);
-      k = realK;
-    } else if (k === "authorized_admins") {
-      val = JSON.stringify(txt.split(/[,,]/).map(s => s.trim()).filter(Boolean));
-    }
-    await setCfg(k, val, env);
-    await sql(env, "DELETE FROM config WHERE key=?", [`admin_state:${id}`]);
-    const displayVal = val.startsWith("{") && k === "welcome_msg" ? "[媒体配置]" : val.substring(0, 100);
-    await api(env.BOT_TOKEN, "sendMessage", { chat_id: id, text: `✅ ${k} 已更新:\n${displayVal}` }).catch(() => { });
-    await handleAdminConfig(id, null, "menu", null, null, env);
-  } catch (e) {
-    api(env.BOT_TOKEN, "sendMessage", { chat_id: id, text: `❌ 失败: ${e.message}` }).catch(() => { });
-  }
+const txt = msg.text || "";
+if (txt === "/cancel") {
+  await sql(env, "DELETE FROM config WHERE key=?", [`admin_state:${id}`]);
+  return handleAdminConfig(id, null, "menu", null, null, env);
 }
-// --- 22. 表态同步 ---
+let k = state.key, val = txt;
+const originalKey = k.replace("_add", ""); // 用于获取标签
+try {
+  if (k === "sleep_start" || k === "sleep_end") {
+    let cleanVal = txt.replace(/：/g, ":").trim();
+    if (/^\d:\d{2}$/.test(cleanVal)) cleanVal = "0" + cleanVal;
+    if (!/^([01]\d|2[0-3]):([0-5]\d)$/.test(cleanVal)) {
+      return api(env.BOT_TOKEN, "sendMessage", {
+        chat_id: id,
+        text: "❌ <b>时间格式错误</b>\n请输入 24 小时制时间,例如 <code>08:00</code> 或 <code>23:30</code>。",
+        parse_mode: "HTML"
+      });
+    }
+    val = cleanVal;
+  }
+  if (k === "welcome_msg") {
+    if (msg.photo || msg.video || msg.animation) {
+      let fileId, type;
+      if (msg.photo) { type = "photo"; fileId = msg.photo[msg.photo.length - 1].file_id; }
+      else if (msg.video) { type = "video"; fileId = msg.video.file_id; }
+      else if (msg.animation) { type = "animation"; fileId = msg.animation.file_id; }
+      val = JSON.stringify({ type: type, file_id: fileId, caption: msg.caption || "" });
+    } else { val = txt; }
+  } else if (k.endsWith("_add")) {
+    k = k.replace("_add", "");
+    const realK = k === "ar" ? "keyword_responses" : k === "kw" ? "block_keywords" : "authorized_admins";
+    const list = await getJsonCfg(realK, env);
+    const arr = Array.isArray(list) ? list : [];
+    if (k === "ar") {
+      const [kk, rr] = txt.split("===");
+      if (kk && rr) arr.push({ keywords: kk, response: rr, id: Date.now() });
+      else return api(env.BOT_TOKEN, "sendMessage", { chat_id: id, text: "❌ 格式错误,请使用:关键词===回复内容" });
+    } else {
+      // 如果当前操作的是管理员列表
+      if (k === "auth") {
+        if (!/^\d+$/.test(txt.trim())) {
+          return api(env.BOT_TOKEN, "sendMessage", {
+            chat_id: id,
+            text: "❌ <b>错误</b>\n请输入纯数字格式的管理员 ID。",
+            parse_mode: "HTML"
+          });
+        }
+      }
+      arr.push(txt.trim());
+    }
+    val = JSON.stringify(arr);
+    k = realK;
+  } else if (k === "authorized_admins") {
+    const ids = txt.split(/[，,]/).map(s => s.trim()).filter(Boolean); // 兼容中英文逗号
+    
+    // 校验每一个 ID 是否都是纯数字
+    const allNumeric = ids.every(id => /^\d+$/.test(id));
+    
+    if (!allNumeric) {
+      return api(env.BOT_TOKEN, "sendMessage", {
+        chat_id: id,
+        text: "❌ <b>格式错误</b>\n管理员 ID 必须是纯数字（例如：123456, 789012）。",
+        parse_mode: "HTML"
+      });
+    }
+    val = JSON.stringify(ids);
+  }
+  await setCfg(k, val, env);
+  await sql(env, "DELETE FROM config WHERE key=?", [`admin_state:${id}`]);
+} catch (e) {
+  api(env.BOT_TOKEN, "sendMessage", { chat_id: id, text: `❌ 失败: ${e.message}` }).catch(() => { });
+}
+const isAdd = state.key.endsWith("_add");
+const label = LABEL_MAP[originalKey] || LABEL_MAP[k] || k;
+
+// 如果是添加操作，只显示用户刚才输入的 txt 内容，而不是整个列表 val [1]
+let displayVal = isAdd ? txt : (val.startsWith("{") && originalKey === "welcome_msg") ? "[媒体配置]" : val.substring(0, 100);
+
+await api(env.BOT_TOKEN, "sendMessage", { 
+    chat_id: id, 
+    text: `✅ <b>${label}</b> ${isAdd ? "已添加" : "已更新"}:\n${displayVal}`,
+    parse_mode: "HTML"
+}).catch(() => { });
+await handleAdminConfig(id, null, "menu", null, null, env);
+}
+
+// --- 21. 表态同步 ---
 async function handleReactionSync(reactionUpdate, env) {
   const { chat, message_id, new_reaction } = reactionUpdate;
   const cid = chat.id.toString();
