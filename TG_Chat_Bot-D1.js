@@ -1461,8 +1461,45 @@ async function handleAdminInput(id, msg, state, env) {
     api(env.BOT_TOKEN, "sendMessage", { chat_id: id, text: `❌ 失败: ${e.message}` }).catch(() => { });
   }
 }
+// --- 22. 表态同步 ---
+async function handleReactionSync(reactionUpdate, env) {
+  const { chat, message_id, new_reaction } = reactionUpdate;
+  const cid = chat.id.toString();
+  const mid = message_id.toString();
+  const isAdmin = cid === env.ADMIN_GROUP_ID;
 
-async function handleDeleteSync(msg, env) {
+  // 根据表态发生的聊天位置，从数据库查找映射的消息 ID
+  const mapping = isAdmin
+    ? await sql(env, "SELECT * FROM msg_mapping WHERE admin_msg_id = ?", [mid], "first")
+    : await sql(env, "SELECT * FROM msg_mapping WHERE user_id = ? AND user_msg_id = ?", [cid, mid], "first");
+
+  if (!mapping) return;
+
+  const targetChat = isAdmin ? mapping.user_id : env.ADMIN_GROUP_ID;
+  const targetMsg = isAdmin ? mapping.user_msg_id : mapping.admin_msg_id;
+
+  try {
+    // 调用 API 将新的表情数组同步到对方的消息上
+    await api(env.BOT_TOKEN, "setMessageReaction", {
+      chat_id: targetChat,
+      message_id: targetMsg,
+      reaction: new_reaction, // 透传用户选择的任意表情
+      is_big: false
+    });
+  } catch (e) {
+    // 忽略表态同步中的非致命错误
+  }
+}
+async function markDelivered(env, chatId, messageId, emoji = DELIVERED_REACTION) {
+  try {
+    await api(env.BOT_TOKEN, "setMessageReaction", {
+      chat_id: chatId,
+      message_id: messageId,
+      reaction: [{ type: "emoji", emoji: emoji }],
+      is_big: false
+    });
+  } catch { }
+}async function handleDeleteSync(msg, env) {
   const replyTo = msg.reply_to_message;
   const chatId = msg.chat.id.toString();
   const isAdminGroup = chatId === env.ADMIN_GROUP_ID;
@@ -1514,45 +1551,6 @@ async function handleEditSync(msg, env) {
     await api(env.BOT_TOKEN, msg.text ? "editMessageText" : "editMessageCaption", {
       chat_id: targetChat, message_id: targetMsg,
       [msg.text ? "text" : "caption"]: content + (isAdmin ? "" : "\n\n(📝 用户已修改内容)")
-    });
-  } catch { }
-}
-// --- 22. 表态同步 ---
-async function handleReactionSync(reactionUpdate, env) {
-  const { chat, message_id, new_reaction } = reactionUpdate;
-  const cid = chat.id.toString();
-  const mid = message_id.toString();
-  const isAdmin = cid === env.ADMIN_GROUP_ID;
-
-  // 根据表态发生的聊天位置，从数据库查找映射的消息 ID
-  const mapping = isAdmin
-    ? await sql(env, "SELECT * FROM msg_mapping WHERE admin_msg_id = ?", [mid], "first")
-    : await sql(env, "SELECT * FROM msg_mapping WHERE user_id = ? AND user_msg_id = ?", [cid, mid], "first");
-
-  if (!mapping) return;
-
-  const targetChat = isAdmin ? mapping.user_id : env.ADMIN_GROUP_ID;
-  const targetMsg = isAdmin ? mapping.user_msg_id : mapping.admin_msg_id;
-
-  try {
-    // 调用 API 将新的表情数组同步到对方的消息上
-    await api(env.BOT_TOKEN, "setMessageReaction", {
-      chat_id: targetChat,
-      message_id: targetMsg,
-      reaction: new_reaction, // 透传用户选择的任意表情
-      is_big: false
-    });
-  } catch (e) {
-    // 忽略表态同步中的非致命错误
-  }
-}
-async function markDelivered(env, chatId, messageId, emoji = DELIVERED_REACTION) {
-  try {
-    await api(env.BOT_TOKEN, "setMessageReaction", {
-      chat_id: chatId,
-      message_id: messageId,
-      reaction: [{ type: "emoji", emoji: emoji }],
-      is_big: false
     });
   } catch { }
 }
