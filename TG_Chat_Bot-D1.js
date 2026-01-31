@@ -1525,7 +1525,7 @@ await api(env.BOT_TOKEN, "sendMessage", {
 await handleAdminConfig(id, null, "menu", null, null, env);
 }
 
-// --- 21. 表态同步 ---
+// --- 21. 表态同步，编辑，撤回 ---
 async function handleReactionSync(reactionUpdate, env) {
   const { chat, message_id, new_reaction } = reactionUpdate;
   const cid = chat.id.toString();
